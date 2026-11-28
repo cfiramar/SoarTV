@@ -3643,23 +3643,32 @@ public final class SoarTvCoreTests {
         assertEquals(-480f, place[0], "X translation centers ultrawide image symmetrically ((3840 - 4800) / 2 = -480)");
         assertEquals(0f, place[1], "Y translation is 0 on full height match");
 
-        // --- 3. R5.4: Slide Duration Interval ---
+        // --- 3. R5.4: Cyclic Slide Duration Interval Ladder (0 "Don't change image" through 2h) ---
         assertEquals(30_000L, Prefs.saverIntervalMs(), "saverIntervalMs defaults to 30s (30,000 ms)");
         assertEquals("30s", Prefs.saverIntervalLabel(), "Default saverIntervalLabel is '30s'");
         long[] intervals = Prefs.SAVER_INTERVALS_MS;
         String[] labels = Prefs.SAVER_INTERVAL_LABELS;
-        assertEquals(7, intervals.length, "Exactly 7 slide interval options defined");
-        assertEquals(7, labels.length, "Exactly 7 slide interval labels defined");
-        assertEquals(10_000L, intervals[0], "Interval 0 is 10s");
-        assertEquals("10s", labels[0], "Label 0 is '10s'");
-        assertEquals(300_000L, intervals[6], "Interval 6 is 5m (300,000 ms)");
-        assertEquals("5m", labels[6], "Label 6 is '5m'");
+        assertEquals(17, intervals.length, "Exactly 17 cyclic slide interval steps defined");
+        assertEquals(17, labels.length, "Exactly 17 slide interval labels defined");
+        assertEquals(0L, intervals[0], "Interval 0 is 0 ms (Don't change image)");
+        assertEquals("Don't change image", labels[0], "Label 0 is 'Don't change image'");
+        assertEquals(10_000L, intervals[1], "Interval 1 is 10s");
+        assertEquals("10s", labels[1], "Label 1 is '10s'");
+        assertEquals(7_200_000L, intervals[16], "Interval 16 is 2h (7,200,000 ms)");
+        assertEquals("2h", labels[16], "Label 16 is '2h'");
 
+        Prefs.setSaverIntervalMs(0L);
+        assertEquals(0L, Prefs.saverIntervalMs(), "Interval can be set to 0 (Don't change image)");
+        assertEquals("Don't change image", Prefs.saverIntervalLabel(), "Label updates to 'Don't change image'");
         Prefs.setSaverIntervalMs(15_000L);
         assertEquals(15_000L, Prefs.saverIntervalMs(), "Interval can be updated to 15s");
         assertEquals("15s", Prefs.saverIntervalLabel(), "Label updates to '15s'");
         Prefs.setSaverIntervalMs(60_000L);
-        assertEquals("1m", Prefs.saverIntervalLabel(), "Label updates to '1m'");
+        assertEquals("60s", Prefs.saverIntervalLabel(), "Label updates to '60s'");
+        Prefs.setSaverIntervalMs(90_000L);
+        assertEquals("1:30 min", Prefs.saverIntervalLabel(), "Label updates to '1:30 min'");
+        Prefs.setSaverIntervalMs(5_400_000L);
+        assertEquals("1:30h", Prefs.saverIntervalLabel(), "Label updates to '1:30h'");
         Prefs.setSaverIntervalMs(30_000L);
 
         // --- 4. R5.3: Curated 61-Hub World Timezone Registry & Formatting ---
@@ -3736,12 +3745,12 @@ public final class SoarTvCoreTests {
         assertEquals("sparkles", animNode.icon, "Animation node icon is sparkles");
         assertEquals("Enabled", animNode.value, "Animation node value reflects state");
 
-        SettingsTree.Node intervalParent = ssParent.findById("ss_interval");
-        assertTrue(intervalParent != null && intervalParent.hasChildren(), "ss_interval node exists with children");
-        assertEquals("Slide Duration", intervalParent.title, "Slide Duration title is correct");
-        assertEquals("timer", intervalParent.icon, "Slide Duration icon is timer");
-        assertEquals("30s", intervalParent.value, "Slide Duration value reflects active interval");
-        assertEquals(7, intervalParent.children.size(), "Slide Duration has 7 interval children");
+        SettingsTree.Node intervalNode = ssParent.findById("ss_interval");
+        assertTrue(intervalNode != null && !intervalNode.hasChildren(), "ss_interval is now a direct Up/Down modal action node");
+        assertEquals(SettingsTree.RowType.ACTION, intervalNode.rowType, "ss_interval rowType is ACTION");
+        assertEquals("Slide Duration", intervalNode.title, "Slide Duration title is correct");
+        assertEquals("timer", intervalNode.icon, "Slide Duration icon is timer");
+        assertEquals("30s", intervalNode.value, "Slide Duration value reflects active interval");
 
         SettingsTree.Node infoParent = ssParent.findById("ss_info_toggles");
         assertTrue(infoParent != null && infoParent.hasChildren(), "ss_info_toggles node exists with children");
@@ -3762,8 +3771,6 @@ public final class SoarTvCoreTests {
 
         // Verify full-width column calculation in SettingsScreenRenderer:
         java.util.List<String> path = java.util.Arrays.asList("display_sound", "screensaver");
-        assertTrue(SettingsScreenRenderer.isLastColumnFullWidth(path, intervalParent),
-                "Slide Duration column expands to 100% full width (leaf)");
         assertTrue(SettingsScreenRenderer.isLastColumnFullWidth(path, infoParent),
                 "Info Toggles column expands to 100% full width (leaf)");
         assertTrue(SettingsScreenRenderer.isLastColumnFullWidth(path, tzParent),

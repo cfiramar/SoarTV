@@ -609,6 +609,214 @@ export interface AuthConfigResponse {
   bootstrapAdmin: boolean;
   handoffToken?: string;
   handoffRole?: RemoteRole | '';
+  tvDeviceId?: string;
+  mdnsHost?: string;
+  tvRoom?: string;
+  tvBrand?: string;
+  tvPlatform?: string;
+  supabaseAnonKey?: string;
+  householdKey?: string;
+}
+
+export interface HouseholdTvDevice {
+  deviceId: string;
+  deviceName: string;
+  roomName: string;
+  platform: 'android-tv' | 'lg-webos' | 'samsung-tizen' | string;
+  brand: string;
+  model: string;
+  lanIp: string;
+  remotePort: number;
+  mdnsHost: string;
+  realtimeChannel: string;
+  lastSeenAt: string;
+}
+
+export interface HouseholdDirectoryCreds {
+  supabaseUrl: string;
+  supabaseAnonKey: string;
+  householdKey: string;
+}
+
+export interface ResolvedTvConnection {
+  mode: 'lan' | 'realtime';
+  baseUrl: string;
+  tv: HouseholdTvDevice | null;
+  source: 'cached' | 'supabase_lan' | 'mdns' | 'udp_lan' | 'realtime';
+}
+
+export interface RealtimeWebSocketLike {
+  readyState: number;
+  onopen: (() => void) | null;
+  onmessage: ((ev: { data: string }) => void) | null;
+  onerror: (() => void) | null;
+  onclose: (() => void) | null;
+  send(data: string): void;
+  close(): void;
+}
+
+export type WebSocketFactory = (url: string) => RealtimeWebSocketLike;
+
+/**
+ * Bidirectional Supabase Realtime Phoenix v1 WebSocket bridge for controlling LG webOS and Samsung Tizen TVs
+ * directly from the Companion Phone Remote (matching `SoarTV-launcher/web/services.js` `SupabaseService`).
+ */
+export class RealtimeTvRemoteBridge {
+  private readonly creds: HouseholdDirectoryCreds;
+  private readonly channelCode: string;
+  private readonly wsFactory: WebSocketFactory;
+  private socket: RealtimeWebSocketLike | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private refCounter = 1;
+  private joined = false;
+  private onStatusChange: ((connected: boolean) => void) | null;
+
+  constructor(
+    creds: HouseholdDirectoryCreds,
+    channelCode: string,
+    options?: {
+      wsFactory?: WebSocketFactory;
+      onStatusChange?: (connected: boolean) => void;
+    }
+  ) {
+    this.creds = creds;
+    this.channelCode = channelCode.trim();
+    this.onStatusChange = options?.onStatusChange ?? null;
+    this.wsFactory =
+      options?.wsFactory ?? ((url: string) => new WebSocket(url) as unknown as RealtimeWebSocketLike);
+  }
+
+  public static buildRealtimeWsUrl(supabaseUrl: string, anonKey: string): string {
+    const clean = TvRemoteService.normalizeBaseUrl(supabaseUrl);
+    if (!clean || !anonKey.trim()) return '';
+    const wsBase = clean.replace(/^https:\/\//i, 'wss://').replace(/^http:\/\//i, 'ws://');
+    return `${wsBase}/realtime/v1/websocket?apikey=${encodeURIComponent(anonKey.trim())}&vsn=1.0.0`;
+  }
+
+  public getTopic(): string {
+    return `realtime:soartv-remote:${this.channelCode}`;
+  }
+
+  public isConnected(): boolean {
+    return this.joined && this.socket !== null && this.socket.readyState === 1;
+  }
+
+  public connect(): void {
+    this.disconnect();
+    const url = RealtimeTvRemoteBridge.buildRealtimeWsUrl(
+      this.creds.supabaseUrl,
+      this.creds.supabaseAnonKey
+    );
+    if (!url || !this.channelCode) return;
+    try {
+      const ws = this.wsFactory(url);
+      this.socket = ws;
+      ws.onopen = () => {
+        ws.send(
+          JSON.stringify({
+            topic: this.getTopic(),
+            event: 'phx_join',
+            payload: { config: { broadcast: { ack: false, self: false } } },
+            ref: String(this.refCounter++),
+          })
+        );
+        this.heartbeatTimer = setInterval(() => {
+          if (this.socket && this.socket.readyState === 1) {
+            this.socket.send(
+              JSON.stringify({
+                topic: 'phoenix',
+                event: 'heartbeat',
+                payload: {},
+                ref: String(this.refCounter++),
+              })
+            );
+          }
+        }, 25_000);
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const parsed = JSON.parse(String(ev.data || '{}')) as {
+            event?: string;
+            payload?: { status?: string };
+          };
+          if (parsed.event === 'phx_reply' && parsed.payload?.status === 'ok') {
+            this.joined = true;
+            this.onStatusChange?.(true);
+          }
+        } catch {
+          // Ignore malformed frame
+        }
+      };
+      ws.onerror = () => {
+        this.joined = false;
+        this.onStatusChange?.(false);
+      };
+      ws.onclose = () => {
+        this.joined = false;
+        if (this.heartbeatTimer) {
+          clearInterval(this.heartbeatTimer);
+          this.heartbeatTimer = null;
+        }
+        this.onStatusChange?.(false);
+      };
+    } catch {
+      this.joined = false;
+      this.onStatusChange?.(false);
+    }
+  }
+
+  public disconnect(): void {
+    this.joined = false;
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.socket) {
+      try {
+        this.socket.onopen = null;
+        this.socket.onmessage = null;
+        this.socket.onerror = null;
+        this.socket.onclose = null;
+        this.socket.close();
+      } catch {
+        // Ignore close errors
+      }
+      this.socket = null;
+    }
+  }
+
+  public sendRemoteCommand(command: Record<string, unknown>): boolean {
+    if (!this.socket || this.socket.readyState !== 1) return false;
+    try {
+      this.socket.send(
+        JSON.stringify({
+          topic: this.getTopic(),
+          event: 'broadcast',
+          payload: {
+            type: 'broadcast',
+            event: 'remote_command',
+            payload: command,
+          },
+          ref: String(this.refCounter++),
+        })
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  public sendKey(key: RemoteKeyName): boolean {
+    return this.sendRemoteCommand({ type: 'key', key });
+  }
+
+  public sendText(text: string, ai: boolean = false): boolean {
+    return this.sendRemoteCommand({ type: 'text', text: text.trim(), ai });
+  }
+
+  public switchProfile(slug: string): boolean {
+    return this.sendRemoteCommand({ type: 'profile', slug: slug.trim() });
+  }
 }
 
 export interface ParsedQrPairingPayload {
@@ -997,6 +1205,160 @@ export class TvRemoteService {
       if (found) {
         return found;
       }
+    }
+    return null;
+  }
+
+  /**
+   * Returns `true` when the target TV is an LG webOS or Samsung Tizen web launcher controlled via
+   * Supabase Realtime instead of an Android TV embedded HTTP server on port 8484.
+   */
+  public static isWebRealtimeTv(tv: HouseholdTvDevice | null | undefined): boolean {
+    if (!tv) return false;
+    const plat = (tv.platform || '').toLowerCase();
+    return plat === 'lg-webos' || plat === 'samsung-tizen' || (!tv.lanIp && Boolean(tv.realtimeChannel));
+  }
+
+  /**
+   * Builds `http://<lanIp>:<port>` for an Android TV directory entry, or `""` when no LAN IP is stored.
+   */
+  public static buildTvBaseUrl(tv: HouseholdTvDevice | null | undefined): string {
+    if (!tv || !tv.lanIp.trim()) return '';
+    const port = tv.remotePort > 0 && tv.remotePort <= 65535 ? tv.remotePort : 8484;
+    return TvRemoteService.normalizeHostInput(`${tv.lanIp.trim()}:${port}`, port);
+  }
+
+  /**
+   * Fetches all active household TVs from Supabase `public.tv_devices` using explicit column projection
+   * (authorized ONLY for ADMIN and HOUSEHOLD remotes that possess `householdKey`).
+   */
+  public static async fetchHouseholdTvDevices(
+    creds: HouseholdDirectoryCreds,
+    fetchImpl?: FetchLike,
+    timeoutMs: number = 3500
+  ): Promise<HouseholdTvDevice[]> {
+    const cleanUrl = TvRemoteService.normalizeBaseUrl(creds.supabaseUrl || '');
+    const anonKey = (creds.supabaseAnonKey || '').trim();
+    const householdKey = (creds.householdKey || '').trim();
+    if (!cleanUrl || !anonKey || !householdKey) return [];
+
+    const selectCols =
+      'device_id,device_name,room_name,platform,brand,model,lan_ip,remote_port,mdns_host,realtime_channel,last_seen_at';
+    const endpoint = `${cleanUrl}/rest/v1/tv_devices?select=${selectCols}&is_active=eq.true&order=last_seen_at.desc`;
+    const baseFetch: FetchLike = fetchImpl ?? ((url, init) => fetch(url, init as RequestInit));
+    const timedFetch = TvRemoteService.createTimeoutFetch(baseFetch, timeoutMs);
+
+    try {
+      const res = await timedFetch(endpoint, {
+        method: 'GET',
+        headers: {
+          apikey: anonKey,
+          Authorization: `Bearer ${anonKey}`,
+          'x-soartv-household-key': householdKey,
+          Accept: 'application/json',
+        },
+      });
+      if (!res.ok) return [];
+      const rows = (await res.json()) as Array<Record<string, unknown>>;
+      if (!Array.isArray(rows)) return [];
+      const out: HouseholdTvDevice[] = [];
+      for (const r of rows) {
+        const deviceId = String(r.device_id || r.device_slug || '').trim();
+        if (!deviceId) continue;
+        const portNum = Number(r.remote_port);
+        out.push({
+          deviceId,
+          deviceName: String(r.device_name || deviceId).trim(),
+          roomName: String(r.room_name || '').trim(),
+          platform: String(r.platform || 'android-tv').trim(),
+          brand: String(r.brand || '').trim(),
+          model: String(r.model || '').trim(),
+          lanIp: String(r.lan_ip || '').trim(),
+          remotePort: Number.isFinite(portNum) && portNum > 0 ? portNum : 8484,
+          mdnsHost: String(r.mdns_host || '').trim(),
+          realtimeChannel: String(r.realtime_channel || '').trim(),
+          lastSeenAt: String(r.last_seen_at || '').trim(),
+        });
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Self-healing multi-TV reconnect cascade:
+   * 1. LG webOS / Samsung Tizen TVs -> Supabase Realtime channel
+   * 2. Cached LAN IP probe
+   * 3. Fresh LAN IP pulled from Supabase `tv_devices` directory (survives any router/DHCP IP change!)
+   * 4. Local mDNS hostname (`soartv-<name>.local`)
+   * 5. Offline LAN UDP broadcast + `/24` scan (`discoverLanTv`)
+   */
+  public static async resolveReachableTv(
+    activeTv: HouseholdTvDevice | null,
+    currentBaseUrl: string,
+    creds: HouseholdDirectoryCreds | null,
+    fetchImpl?: FetchLike
+  ): Promise<ResolvedTvConnection | null> {
+    if (activeTv && TvRemoteService.isWebRealtimeTv(activeTv) && creds?.supabaseUrl && creds?.supabaseAnonKey) {
+      return {
+        mode: 'realtime',
+        baseUrl: '',
+        tv: activeTv,
+        source: 'realtime',
+      };
+    }
+
+    // Step 1: Cached LAN URL
+    const cleanCurrent = TvRemoteService.normalizeHostInput(currentBaseUrl || '');
+    if (cleanCurrent) {
+      const hit = await TvRemoteService.probeLanTv([cleanCurrent], fetchImpl, 900);
+      if (hit) {
+        return { mode: 'lan', baseUrl: hit, tv: activeTv, source: 'cached' };
+      }
+    }
+
+    // Step 2: Fresh LAN IP from Supabase `tv_devices`
+    let matchedTv = activeTv;
+    if (creds && creds.supabaseUrl && creds.supabaseAnonKey && creds.householdKey) {
+      const freshTvs = await TvRemoteService.fetchHouseholdTvDevices(creds, fetchImpl, 3000);
+      if (freshTvs.length > 0) {
+        if (activeTv) {
+          matchedTv = freshTvs.find((t) => t.deviceId === activeTv.deviceId) ?? activeTv;
+        } else {
+          matchedTv = freshTvs.find((t) => !TvRemoteService.isWebRealtimeTv(t)) ?? freshTvs[0];
+        }
+        if (matchedTv && TvRemoteService.isWebRealtimeTv(matchedTv)) {
+          return { mode: 'realtime', baseUrl: '', tv: matchedTv, source: 'realtime' };
+        }
+        const freshUrl = TvRemoteService.buildTvBaseUrl(matchedTv);
+        if (freshUrl && freshUrl !== cleanCurrent) {
+          const hit = await TvRemoteService.probeLanTv([freshUrl], fetchImpl, 1200);
+          if (hit) {
+            return { mode: 'lan', baseUrl: hit, tv: matchedTv, source: 'supabase_lan' };
+          }
+        }
+      }
+    }
+
+    // Step 3: Local mDNS hostname
+    if (matchedTv && matchedTv.mdnsHost) {
+      const mdnsUrl = TvRemoteService.normalizeHostInput(
+        `${matchedTv.mdnsHost}:${matchedTv.remotePort || 8484}`,
+        matchedTv.remotePort || 8484
+      );
+      if (mdnsUrl) {
+        const hit = await TvRemoteService.probeLanTv([mdnsUrl], fetchImpl, 900);
+        if (hit) {
+          return { mode: 'lan', baseUrl: hit, tv: matchedTv, source: 'mdns' };
+        }
+      }
+    }
+
+    // Step 4: Offline LAN UDP / subnet discovery
+    const lanFound = await TvRemoteService.discoverLanTv(cleanCurrent, fetchImpl, 6, 650);
+    if (lanFound) {
+      return { mode: 'lan', baseUrl: lanFound, tv: matchedTv, source: 'udp_lan' };
     }
     return null;
   }

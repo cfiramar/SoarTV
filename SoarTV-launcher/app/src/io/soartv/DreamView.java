@@ -876,7 +876,8 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
             prepareNext();
             return;
         }
-        if (incoming == null && prepared != null && pendingManualKey == null && up >= current.startedAt + showDurationMs()) {
+        if (incoming == null && prepared != null && pendingManualKey == null
+                && shouldAutoAdvanceSlide(up - current.startedAt, showDurationMs())) {
             incoming = prepared;
             prepared = null;
             incoming.startedAt = up;
@@ -931,13 +932,40 @@ final class DreamView extends View implements Choreographer.FrameCallback, HomeD
         glassShader.setInputShader("imageB", (incoming != null && incoming.shader != null) ? incoming.shader : current.shader);
     }
 
+    /** Half-period (in ms) for gentle Ken Burns breathing motion when slide duration is "Don't change image" (0). */
+    static final long STATIC_KEN_BURNS_HALF_PERIOD_MS = 45_000L;
+
+    /**
+     * Returns whether the active screensaver photo should automatically transition to the next slide.
+     * When {@code intervalMs <= 0} ("Don't change image"), automatic transitions are disabled while
+     * manual Left/Right remote navigation remains available.
+     */
+    static boolean shouldAutoAdvanceSlide(long elapsedMs, long intervalMs) {
+        return intervalMs > 0L && elapsedMs >= intervalMs;
+    }
+
+    /**
+     * Computes normalized Ken Burns motion progress {@code [0, 1]} for the active slide.
+     * When {@code intervalMs <= 0} ("Don't change image"), oscillates smoothly between 0 and 1 over
+     * {@link #STATIC_KEN_BURNS_HALF_PERIOD_MS} so enabled image animations drift gently without snapping.
+     */
+    static float computeKenBurnsProgress(long elapsedMs, long intervalMs) {
+        long safeElapsed = Math.max(0L, elapsedMs);
+        if (intervalMs <= 0L) {
+            long fullCycle = STATIC_KEN_BURNS_HALF_PERIOD_MS * 2L;
+            float phase = (safeElapsed % fullCycle) / (float) STATIC_KEN_BURNS_HALF_PERIOD_MS;
+            return phase <= 1f ? phase : (2f - phase);
+        }
+        return Math.max(0f, Math.min(1f, safeElapsed / (float) (intervalMs + FADE_MS)));
+    }
+
     /** Photo position and scale now: zoom from 1 to 1.1 (or back) and a pan toward a corner, never showing an edge. */
     private void place(Slide s, long up, float[] out) {
         if (!Prefs.saverAnimation()) {
             computeStaticCenterPlacement(w, h, s.image.getWidth(), s.image.getHeight(), out);
             return;
         }
-        float u = Ui.clamp((up - s.startedAt) / (float) (showDurationMs() + FADE_MS));
+        float u = computeKenBurnsProgress(up - s.startedAt, showDurationMs());
         float f = s.zoomIn ? u : 1 - u;
         float z = 1 + ZOOM * f;
         float rx = w * (z - 1) / 2, ry = h * (z - 1) / 2;

@@ -130,6 +130,7 @@ public class HomeActivity extends Activity {
         appliedCity = Prefs.city();
         prefsVersion = Prefs.version;
         UserProfileManager.get(this).syncWithCloudAsync(null);
+        CloudSyncManager.get(this).syncNowAsync("boot", null);
         ScreensaverCatalog.prefetchAsync(this);
         home = new HomeView(this);
         setContentView(home);
@@ -194,12 +195,14 @@ public class HomeActivity extends Activity {
             }
         }
         if (home != null) home.resume();
+        CloudSyncManager.get(this).onHomeResumed();
         Updates.tellOnce(this);   // an update the week's check got ready: said once
         GamingZone.handleLauncherResume(this);
     }
 
     @Override protected void onPause() {
         resumed = false;
+        CloudSyncManager.get(this).onHomePaused();
         stopScreensaverNow(false);
         if (home != null) {
             retainedNavSnapshot = home.captureNavigationSnapshot();

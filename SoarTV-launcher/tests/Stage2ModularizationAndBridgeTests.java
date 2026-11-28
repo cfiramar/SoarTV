@@ -350,11 +350,17 @@ public final class Stage2ModularizationAndBridgeTests {
                 "Active Guest remote displays days remaining: " + (guestRow != null ? guestRow.value : "null"));
         assertTrue(expRow != null && "Expired".equals(expRow.value), "Expired Guest remote displays 'Expired' status");
 
-        // Verify Encrypted Cloud Vault Backup & Restore under Step 5 Private API Keys & Cloud Database
+        // Verify Cloud Sync v2, Automatic Encrypted Vault, Household TVs & Per-TV Override controls
         SettingsTree.Node setupKeys = root.findById("setup_keys");
         assertTrue(setupKeys != null, "SettingsTree contains 'setup_keys'");
-        assertTrue(setupKeys.findById("vault_backup") != null, "setup_keys contains 'vault_backup'");
-        assertTrue(setupKeys.findById("vault_restore") != null, "setup_keys contains 'vault_restore'");
+        assertTrue(setupKeys.findById("setup_cloud_sync_now") != null, "setup_keys contains 'setup_cloud_sync_now'");
+        assertTrue(setupKeys.findById("setup_cloud_tv_devices") != null, "setup_keys contains 'setup_cloud_tv_devices'");
+        assertTrue(root.findById("cloud_sync_now") != null, "users contains 'cloud_sync_now'");
+        assertTrue(root.findById("cloud_tv_devices") != null, "users contains 'cloud_tv_devices'");
+        assertTrue(root.findById("stremio_use_household") != null, "users contains 'stremio_use_household'");
+        assertTrue(root.findById("tv_override_shelf") != null, "home_interface contains 'tv_override_shelf'");
+        assertTrue(root.findById("tv_override_hidden_apps") != null, "home_interface contains 'tv_override_hidden_apps'");
+        assertTrue(root.findById("tv_override_screensaver") != null, "screensaver contains 'tv_override_screensaver'");
 
         // Universal audit: EVERY node in the entire SettingsTree must use a supported Symbols icon and contain ZERO emojis
         List<SettingsTree.Node> allNodes = new ArrayList<>();

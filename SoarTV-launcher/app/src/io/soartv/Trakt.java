@@ -172,6 +172,65 @@ final class Trakt {
         return c.getApplicationContext().getSharedPreferences("trakt", Context.MODE_PRIVATE);
     }
 
+    private static String activeProfileId(Context c) {
+        if (c == null) return "";
+        try {
+            UserProfileManager.Profile p = UserProfileManager.get(c).getActiveProfile();
+            return p != null ? p.id : "";
+        } catch (RuntimeException ignored) {
+            return "";
+        }
+    }
+
+    private static boolean isDefaultProfileActive(Context c) {
+        if (c == null) return true;
+        try {
+            UserProfileManager.Profile p = UserProfileManager.get(c).getActiveProfile();
+            return p == null || p.isDefault;
+        } catch (RuntimeException ignored) {
+            return true;
+        }
+    }
+
+    private static void migrateLegacyTraktIfNeeded(Context c, String profileId) {
+        if (c == null || profileId == null || profileId.isEmpty() || !isDefaultProfileActive(c)) return;
+        String curRefresh = Secrets.getProfileSecret(c, profileId, "trakt_refresh");
+        String curAccess = Secrets.getProfileSecret(c, profileId, "trakt_access");
+        if (!curRefresh.isEmpty() || !curAccess.isEmpty()) return;
+        SharedPreferences legacy = sp(c);
+        String legRefresh = legacy.getString("refresh", "");
+        String legAccess = legacy.getString("access", "");
+        if (!legRefresh.isEmpty() || !legAccess.isEmpty()) {
+            Secrets.putProfileSecret(c, profileId, "trakt_access", legAccess);
+            Secrets.putProfileSecret(c, profileId, "trakt_refresh", legRefresh);
+            Secrets.putProfileSecret(c, profileId, "trakt_expires", String.valueOf(legacy.getLong("expires", 0L)));
+            Secrets.putProfileSecret(c, profileId, "trakt_user", legacy.getString("user", ""));
+            legacy.edit().clear().apply();
+        }
+    }
+
+    private static String readProfileTokenField(Context c, String key) {
+        if (c == null) return "";
+        String pid = activeProfileId(c);
+        if (!pid.isEmpty()) {
+            migrateLegacyTraktIfNeeded(c, pid);
+            String val = Secrets.getProfileSecret(c, pid, "trakt_" + key);
+            if (!val.isEmpty()) return val;
+        }
+        return isDefaultProfileActive(c) ? sp(c).getString(key, "") : "";
+    }
+
+    private static long readProfileExpires(Context c) {
+        String raw = readProfileTokenField(c, "expires");
+        if (!raw.isEmpty()) {
+            try {
+                return Long.parseLong(raw.trim());
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return isDefaultProfileActive(c) ? sp(c).getLong("expires", 0L) : 0L;
+    }
+
     /** Returns the active user profile's Trakt username, falling back to Config.TRAKT_USERNAME. */
     static String configuredUser(Context c) {
         try {
@@ -186,8 +245,7 @@ final class Trakt {
 
     static boolean hasOAuth(Context c) {
         if (!available(c) || c == null) return false;
-        SharedPreferences prefs = sp(c);
-        return !prefs.getString("refresh", "").isEmpty() || !prefs.getString("access", "").isEmpty();
+        return !readProfileTokenField(c, "refresh").isEmpty() || !readProfileTokenField(c, "access").isEmpty();
     }
 
     static boolean signedIn(Context c) {
@@ -197,7 +255,7 @@ final class Trakt {
     /** The account's name ("" if not signed in). */
     static String user(Context c) {
         if (!signedIn(c)) return "";
-        String oauthUser = sp(c).getString("user", "");
+        String oauthUser = readProfileTokenField(c, "user");
         return !oauthUser.isEmpty() ? oauthUser : configuredUser(c);
     }
 
@@ -278,7 +336,13 @@ final class Trakt {
                         } catch (Exception e) {
                             AppLog.w("trakt user: " + e.getMessage());
                         }
-                        sp(app).edit().putString("user", name).commit();
+                        String pid = activeProfileId(app);
+                        if (!pid.isEmpty()) {
+                            Secrets.putProfileSecret(app, pid, "trakt_user", name);
+                            CloudSyncManager.get(app).recordLocalSecretChange(CloudSyncManager.Scope.PROFILE, "trakt_user");
+                        } else {
+                            sp(app).edit().putString("user", name).commit();
+                        }
                         Prefs.version++;
                         AppLog.w("trakt: signed in");
                         return;
@@ -325,9 +389,18 @@ final class Trakt {
 
     /** Forgets the account here and tells Trakt to drop the token (in the background, best effort). */
     static void signOut(Context c) {
-        SharedPreferences sp = sp(c);
-        String token = sp.getString("access", "");
-        sp.edit().clear().apply();
+        String token = readProfileTokenField(c, "access");
+        String pid = activeProfileId(c);
+        if (!pid.isEmpty()) {
+            Secrets.putProfileSecret(c, pid, "trakt_access", "");
+            Secrets.putProfileSecret(c, pid, "trakt_refresh", "");
+            Secrets.putProfileSecret(c, pid, "trakt_expires", "");
+            Secrets.putProfileSecret(c, pid, "trakt_user", "");
+            CloudSyncManager.get(c).recordLocalSecretChange(CloudSyncManager.Scope.PROFILE, "trakt_refresh");
+        }
+        if (isDefaultProfileActive(c)) {
+            sp(c).edit().clear().apply();
+        }
         message = "";
         Prefs.version++;
         if (token.isEmpty()) return;
@@ -341,16 +414,25 @@ final class Trakt {
 
     private static void save(Context c, JSONObject t) {
         long created = t.optLong("created_at", System.currentTimeMillis() / 1000);
-        sp(c).edit().putString("access", t.optString("access_token")).putString("refresh", t.optString("refresh_token"))
-                .putLong("expires", (created + t.optLong("expires_in", 86400)) * 1000L).commit();
+        long expires = (created + t.optLong("expires_in", 86400)) * 1000L;
+        String access = t.optString("access_token");
+        String refresh = t.optString("refresh_token");
+        String pid = activeProfileId(c);
+        if (!pid.isEmpty()) {
+            Secrets.putProfileSecret(c, pid, "trakt_access", access);
+            Secrets.putProfileSecret(c, pid, "trakt_refresh", refresh);
+            Secrets.putProfileSecret(c, pid, "trakt_expires", String.valueOf(expires));
+            CloudSyncManager.get(c).recordLocalSecretChange(CloudSyncManager.Scope.PROFILE, "trakt_refresh");
+        } else {
+            sp(c).edit().putString("access", access).putString("refresh", refresh).putLong("expires", expires).commit();
+        }
     }
 
     /** A valid access token, renewed when it's about to expire (Trakt's last a day). Off the UI thread. */
     private static synchronized String token(Context c) throws Exception {
-        SharedPreferences sp = sp(c);
-        String access = sp.getString("access", "");
-        String refresh = sp.getString("refresh", "");
-        if (!access.isEmpty() && System.currentTimeMillis() < sp.getLong("expires", 0) - 3600_000L) return access;
+        String access = readProfileTokenField(c, "access");
+        String refresh = readProfileTokenField(c, "refresh");
+        if (!access.isEmpty() && System.currentTimeMillis() < readProfileExpires(c) - 3600_000L) return access;
         if (refresh.isEmpty()) {
             if (!access.isEmpty()) return access;
             throw new IOException("not signed in");
@@ -359,15 +441,14 @@ final class Trakt {
                 .put("redirect_uri", "http://localhost").put("grant_type", "refresh_token"), null);
         if (r.code == 400 || r.code == 401) {
             // The person disconnected the app on trakt.tv (or the token is gone): signed out here too.
-            sp.edit().clear().apply();
-            Prefs.version++;
+            signOut(c);
             throw new IOException("Trakt signed this TV out");
         }
         if (r.code != 200) throw new IOException("Trakt returned HTTP " + r.code);
         // Signed out (or in again) while this was on its way: the new token isn't theirs anymore.
-        if (!refresh.equals(sp.getString("refresh", ""))) throw new IOException("not signed in");
+        if (!refresh.equals(readProfileTokenField(c, "refresh"))) throw new IOException("not signed in");
         save(c, new JSONObject(r.body));
-        return sp.getString("access", "");
+        return readProfileTokenField(c, "access");
     }
 
     // MARK: - Lists

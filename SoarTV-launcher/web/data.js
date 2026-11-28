@@ -58,8 +58,14 @@ var Prefs = (function () {
   'use strict';
   var KEY = 'soartv.prefs';
   var v = {};
+  var changeListeners = [];
   try { v = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) {}
   function save() { try { localStorage.setItem(KEY, JSON.stringify(v)); } catch (e) {} }
+  function emitChange(name) {
+    for (var i = 0; i < changeListeners.length; i++) {
+      try { changeListeners[i](name); } catch (e) {}
+    }
+  }
   function pick(name, fallback) { return v[name] === undefined ? fallback : v[name]; }
   function str(name, cfgKey, defVal) {
     var val = pick(name, (CONFIG && CONFIG[cfgKey]) || defVal || '');
@@ -81,14 +87,32 @@ var Prefs = (function () {
     forecast: function () { return pick('forecast', 'hours') === 'days' ? 'days' : 'hours'; },
     cards: function () { var n = pick('cards', 3); return n < 3 ? 3 : n > 6 ? 6 : n; },
     hideAnimation: function () { return pick('hideAnimation', CONFIG.hideAnimation === true) === true; },
-    shelf: function () { return pick('shelf', null); },
+    shelf: function () {
+      if (pick('tvOverrideShelf', false) === true) {
+        var ov = pick('tvShelfOverride', null);
+        if (Array.isArray(ov)) return ov;
+      }
+      return pick('shelf', null);
+    },
+    profileShelf: function () { return pick('shelf', null); },
+    tvOverrideShelfList: function () { return pick('tvShelfOverride', null); },
+    tvOverrideShelf: function () { return pick('tvOverrideShelf', false) === true; },
+    tvOverrideHiddenApps: function () { return pick('tvOverrideHiddenApps', false) === true; },
+    tvOverrideScreensaver: function () { return pick('tvOverrideScreensaver', false) === true; },
+    useHouseholdStremio: function () { return pick('useHouseholdStremio', false) === true; },
+    deviceName: function () { return str('deviceName', 'deviceName', ''); },
+    hiddenApps: function () {
+      var key = pick('tvOverrideHiddenApps', false) === true ? 'tvHiddenAppsOverride' : 'hiddenApps';
+      var a = pick(key, null);
+      return Array.isArray(a) ? a : [];
+    },
     shelfConfig: function () { return pick('shelfConfig', ''); },
     city: function () { return pick('city', Place.city); },
     latitude: function () { return pick('latitude', Place.lat); },
     longitude: function () { return pick('longitude', Place.lon); },
     tmdbKey: function () { return String(pick('tmdbKey', CONFIG.tmdbKey || '')).replace(/^\s+|\s+$/g, ''); },
     tmdbKeyOnTV: function () { return v.tmdbKey !== undefined; },
-    setCity: function (name, lat, lon) { v.city = name; v.latitude = lat; v.longitude = lon; save(); this.version++; },
+    setCity: function (name, lat, lon) { v.city = name; v.latitude = lat; v.longitude = lon; save(); this.version++; emitChange('city'); },
     serviceOff: function (key) { return pick('servicesOff', CONFIG.hideServices || []).indexOf(key) >= 0; },
     setServiceOff: function (key, off) {
       var list = pick('servicesOff', CONFIG.hideServices || []).filter(function (k) { return k !== key; });
@@ -161,7 +185,31 @@ var Prefs = (function () {
       return Array.isArray(a) ? a : null;
     },
 
-    set: function (name, value) { v[name] = value; save(); this.version++; }
+    set: function (name, value) {
+      if (name === 'shelf' && pick('tvOverrideShelf', false) === true) {
+        v.tvShelfOverride = value;
+        save();
+        this.version++;
+        emitChange('tvShelfOverride');
+        return;
+      }
+      v[name] = value;
+      save();
+      this.version++;
+      emitChange(name);
+    },
+    setSilent: function (name, value) {
+      if (value === undefined) delete v[name];
+      else v[name] = value;
+      save();
+      this.version++;
+    },
+    rawSnapshot: function () {
+      var copy = {}, k;
+      for (k in v) if (Object.prototype.hasOwnProperty.call(v, k)) copy[k] = v[k];
+      return copy;
+    },
+    onChange: function (fn) { if (typeof fn === 'function') changeListeners.push(fn); }
   };
 })();
 

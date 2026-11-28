@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
+  RealtimeTvRemoteBridge,
   TvRemoteService,
   TvStatus,
   RemoteForbiddenError,
@@ -1229,5 +1230,117 @@ describe('TvRemoteService', () => {
     expect(isIosStandaloneWebApp('Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X)', true)).toBe(true);
     expect(isIosStandaloneWebApp('Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X)', false)).toBe(false);
     expect(isIosStandaloneWebApp('Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro)', true)).toBe(false);
+  });
+
+  it('fetches Household TVs from Supabase, self-heals after router DHCP IP change, and bridges LG/Samsung via Realtime', async () => {
+    const creds = {
+      supabaseUrl: 'https://demo-hh.supabase.co',
+      supabaseAnonKey: 'anon_key_abc',
+      householdKey: 'hh_secret_key_xyz',
+    };
+
+    const cloudRows = [
+      {
+        device_id: 'tv-living-uuid',
+        device_name: 'Living Room TV',
+        room_name: 'Living Room',
+        platform: 'android-tv',
+        brand: 'SONY',
+        model: 'XR-65A80L',
+        lan_ip: '192.168.50.88',
+        remote_port: 8484,
+        mdns_host: 'soartv-living-room-tv.local',
+        realtime_channel: '',
+        last_seen_at: '2026-11-28T10:00:00Z',
+      },
+      {
+        device_id: 'tv-bedroom-lg',
+        device_name: 'Bedroom OLED',
+        room_name: 'Bedroom',
+        platform: 'lg-webos',
+        brand: 'LG_WEBOS',
+        model: 'OLED55C3',
+        lan_ip: '192.168.50.91',
+        remote_port: 8484,
+        mdns_host: 'soartv-bedroom-oled.local',
+        realtime_channel: 'tv-bedroom-lg',
+        last_seen_at: '2026-11-28T09:50:00Z',
+      },
+    ];
+
+    const mockFetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/rest/v1/tv_devices')) {
+        return { ok: true, status: 200, json: async () => cloudRows };
+      }
+      if (url === 'http://192.168.50.88:8484/api/auth/config') {
+        return { ok: true, status: 200, json: async () => ({ paired: true, role: 'ADMIN', tvName: 'Living Room TV' }) };
+      }
+      throw new Error('ECONNREFUSED');
+    });
+
+    const tvs = await TvRemoteService.fetchHouseholdTvDevices(creds, mockFetch);
+    expect(tvs).toHaveLength(2);
+    expect(tvs[0].deviceId).toBe('tv-living-uuid');
+    expect(TvRemoteService.isWebRealtimeTv(tvs[0])).toBe(false);
+    expect(TvRemoteService.isWebRealtimeTv(tvs[1])).toBe(true);
+
+    // Self-healing cascade: old IP .42 fails -> fetches fresh .88 from Supabase tv_devices -> reconnects!
+    const healed = await TvRemoteService.resolveReachableTv(
+      { ...tvs[0], lanIp: '192.168.50.42' },
+      'http://192.168.50.42:8484',
+      creds,
+      mockFetch
+    );
+    expect(healed?.mode).toBe('lan');
+    expect(healed?.source).toBe('supabase_lan');
+    expect(healed?.baseUrl).toBe('http://192.168.50.88:8484');
+
+    // LG webOS TV routes directly to Supabase Realtime mode
+    const lgConn = await TvRemoteService.resolveReachableTv(tvs[1], '', creds, mockFetch);
+    expect(lgConn?.mode).toBe('realtime');
+    expect(lgConn?.source).toBe('realtime');
+
+    // RealtimeTvRemoteBridge sends Phoenix phx_join + remote_command broadcast frames
+    const sentFrames: string[] = [];
+    let statusObserved = false;
+    let fakeWs: {
+      readyState: number;
+      onopen: (() => void) | null;
+      onmessage: ((ev: { data: string }) => void) | null;
+      onerror: (() => void) | null;
+      onclose: (() => void) | null;
+      send: (data: string) => void;
+      close: () => void;
+    } | null = null;
+    const bridge = new RealtimeTvRemoteBridge(creds, 'tv-bedroom-lg', {
+      wsFactory: () => {
+        fakeWs = {
+          readyState: 1,
+          onopen: null,
+          onmessage: null,
+          onerror: null,
+          onclose: null,
+          send: (d: string) => sentFrames.push(d),
+          close: () => {
+            if (fakeWs) fakeWs.readyState = 3;
+          },
+        };
+        return fakeWs;
+      },
+      onStatusChange: (ok) => {
+        statusObserved = ok;
+      },
+    });
+    bridge.connect();
+    fakeWs!.onopen?.();
+    fakeWs!.onmessage?.({ data: JSON.stringify({ event: 'phx_reply', payload: { status: 'ok' } }) });
+    expect(statusObserved).toBe(true);
+    expect(bridge.isConnected()).toBe(true);
+    expect(bridge.sendKey('right')).toBe(true);
+    expect(bridge.sendText('Severance', true)).toBe(true);
+    expect(sentFrames.some((f) => f.includes('"event":"phx_join"') && f.includes('realtime:soartv-remote:tv-bedroom-lg'))).toBe(true);
+    expect(sentFrames.some((f) => f.includes('"event":"remote_command"') && f.includes('"key":"right"'))).toBe(true);
+    expect(sentFrames.some((f) => f.includes('"text":"Severance"') && f.includes('"ai":true'))).toBe(true);
+    bridge.disconnect();
   });
 });

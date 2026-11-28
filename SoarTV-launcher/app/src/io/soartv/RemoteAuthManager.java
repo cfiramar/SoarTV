@@ -973,6 +973,31 @@ public final class RemoteAuthManager {
         out.put("supabaseUrl", supabaseUrl);
         out.put("tvName", tvName != null && !tvName.isEmpty() ? tvName : "SoarTV");
         out.put("bootstrapAdmin", !hasAnyAdminDevice());
+        if (appContext != null) {
+            try {
+                TvDeviceIdentity id = TvDeviceIdentity.get(appContext);
+                out.put("tvDeviceId", id.getDeviceId());
+                out.put("mdnsHost", id.getMdnsHost());
+                out.put("tvRoom", SmartHomeManager.get(appContext).getTvRoom());
+                out.put("tvBrand", TvDeviceProfile.current().getBrand().name());
+                out.put("tvPlatform", TvDeviceIdentity.PLATFORM_ANDROID_TV);
+            } catch (RuntimeException ignored) {
+            }
+        }
+        // Authenticated ADMIN and HOUSEHOLD remotes receive household TV-directory access for multi-TV
+        // switching, IP-change self-healing, and LG/Samsung Realtime remote control.
+        // GUEST (30-day) remotes NEVER receive household_key and stay strictly LAN-scoped.
+        if (auth.isAuthenticated() && auth.device != null
+                && (auth.device.role == Role.ADMIN || auth.device.role == Role.HOUSEHOLD)) {
+            String anonKey = resolveSupabaseAnonKey();
+            String hhKey = appContext != null
+                    ? SupabaseClient.get(appContext).resolveHouseholdKey()
+                    : Secrets.getSecret(null, SupabaseClient.SECRET_HOUSEHOLD_KEY);
+            if (!supabaseUrl.isEmpty() && !anonKey.isEmpty() && !hhKey.isEmpty()) {
+                out.put("supabaseAnonKey", anonKey);
+                out.put("householdKey", hhKey);
+            }
+        }
         if (!auth.isAuthenticated() && clientIp != null && !clientIp.trim().isEmpty()) {
             ApkHandoff handoff = apkHandoffByIp.get(clientIp.trim());
             if (handoff != null && (clock.getAsLong() - handoff.timestampMs) <= APK_HANDOFF_TTL_MS) {
@@ -1062,6 +1087,11 @@ public final class RemoteAuthManager {
         return dev;
     }
 
+    /** Reloads paired Companion Remote device records after a Household Cloud Vault sync. */
+    public synchronized void reloadFromSecrets() {
+        loadFromSecrets();
+    }
+
     @SuppressWarnings("unchecked")
     private synchronized void loadFromSecrets() {
         devicesById.clear();
@@ -1092,6 +1122,7 @@ public final class RemoteAuthManager {
     private synchronized void saveToSecrets() {
         if (devicesById.isEmpty()) {
             Secrets.deleteSecret(appContext, Secrets.REMOTE_PAIRED_DEVICES);
+            notifyHouseholdRemoteVaultChanged();
             return;
         }
         List<Map<String, Object>> arr = new ArrayList<>(devicesById.size());
@@ -1099,6 +1130,16 @@ public final class RemoteAuthManager {
             arr.add(d.toStorageMap());
         }
         Secrets.putSecret(appContext, Secrets.REMOTE_PAIRED_DEVICES, MiniJson.stringify(arr));
+        notifyHouseholdRemoteVaultChanged();
+    }
+
+    private void notifyHouseholdRemoteVaultChanged() {
+        if (appContext == null) return;
+        try {
+            CloudSyncManager.get(appContext).recordLocalSecretChange(
+                    CloudSyncManager.Scope.HOUSEHOLD, Secrets.REMOTE_PAIRED_DEVICES);
+        } catch (RuntimeException ignored) {
+        }
     }
 
     private static boolean allowRateLimit(Map<String, List<Long>> map, String ip, int maxPerWindow, long nowMs) {

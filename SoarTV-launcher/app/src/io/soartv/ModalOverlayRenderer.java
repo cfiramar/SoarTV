@@ -73,6 +73,12 @@ public final class ModalOverlayRenderer {
     static final int SLEEP_HIT_SAVE = 3;
     static final int SLEEP_HIT_CANCEL = 4;
 
+    /** Hit-test outcomes for {@link #hitTestSlideDurationModal}. */
+    static final int SD_HIT_OUTSIDE = -2;
+    static final int SD_HIT_NONE = -1;
+    static final int SD_HIT_UP = 10;
+    static final int SD_HIT_DOWN = 11;
+
     /** Hit-test outcomes for {@link #hitTestStreamQualityModal}. */
     static final int SQ_HIT_OUTSIDE = -2;
     static final int SQ_HIT_NONE = -1;
@@ -568,6 +574,80 @@ public final class ModalOverlayRenderer {
     }
 
     /**
+     * Pure-Java interactive state model for the Liquid Glass Up/Down Screensaver Slide Duration modal.
+     *
+     * <p><b>Why:</b> Replaces a flat closed submenu with an effortless cyclic Up/Down duration wheel
+     * spanning {@code "Don't change image"} ({@code 0}) through {@code 2h} and wrapping back to {@code 0}.
+     */
+    public static final class SlideDurationModalState {
+        private long intervalMs;
+
+        public SlideDurationModalState(long initialMs) {
+            this.intervalMs = Math.max(0L, initialMs);
+        }
+
+        public long getIntervalMs() {
+            return intervalMs;
+        }
+
+        public int getStepIndex() {
+            return Prefs.saverIntervalIndex(intervalMs);
+        }
+
+        public int getTotalSteps() {
+            return Prefs.SAVER_INTERVALS_MS.length;
+        }
+
+        public boolean isStaticMode() {
+            return intervalMs <= 0L;
+        }
+
+        public String getLabel() {
+            return Prefs.formatSaverIntervalLabel(intervalMs);
+        }
+
+        public String getNextLabel() {
+            return Prefs.formatSaverIntervalLabel(Prefs.nextSaverIntervalUp(intervalMs));
+        }
+
+        public String getPrevLabel() {
+            return Prefs.formatSaverIntervalLabel(Prefs.nextSaverIntervalDown(intervalMs));
+        }
+
+        public String getCaption() {
+            if (intervalMs <= 0L) {
+                return "Photo stays fixed until you press Left or Right";
+            }
+            return "Switches to a new 4K photo every " + getLabel();
+        }
+
+        public void stepUp() {
+            intervalMs = Prefs.nextSaverIntervalUp(intervalMs);
+        }
+
+        public void stepDown() {
+            intervalMs = Prefs.nextSaverIntervalDown(intervalMs);
+        }
+
+        /**
+         * Routes TV remote D-pad and gaming controller directional inputs:
+         * Up (or Right) advances to the next duration (wrapping 2h -> 0);
+         * Down (or Left) steps to the previous duration (wrapping 0 -> 2h).
+         */
+        public boolean moveFocus(int dx, int dy) {
+            if (dy < 0 || dx > 0) {
+                stepUp();
+                return true;
+            }
+            if (dy > 0 || dx < 0) {
+                stepDown();
+                return true;
+            }
+            return false;
+        }
+    }
+
+    /**
      * Pure state model for Canvas-rendered Liquid Glass text, PIN, and Vault passphrase modals ({@code INC-04}).
      */
     public static class LiquidGlassInputState {
@@ -658,6 +738,12 @@ public final class ModalOverlayRenderer {
     private RectF[] sqDownRects;
     private RectF sqScratchRect;
 
+    private RectF sdPanelRect;
+    private RectF sdCardRect;
+    private RectF sdUpArrowRect;
+    private RectF sdDownArrowRect;
+    private RectF sdScratchRect;
+
     /**
      * Creates a new {@link ModalOverlayRenderer} safe for headless Desktop JVM instantiation.
      */
@@ -698,6 +784,11 @@ public final class ModalOverlayRenderer {
             sqUpRects = new RectF[] {new RectF(), new RectF(), new RectF()};
             sqDownRects = new RectF[] {new RectF(), new RectF(), new RectF()};
             sqScratchRect = new RectF();
+            sdPanelRect = new RectF();
+            sdCardRect = new RectF();
+            sdUpArrowRect = new RectF();
+            sdDownArrowRect = new RectF();
+            sdScratchRect = new RectF();
         }
     }
 
@@ -1522,6 +1613,160 @@ public final class ModalOverlayRenderer {
         String footer = Ui.tr("Up / Down Adjust duration  \u00B7  Left / Right Switch control  \u00B7  OK Save  \u00B7  Back Cancel");
         String clipped = TextUtils.ellipsize(footer, fitPaint, mw - 72 * k, TextUtils.TruncateAt.END).toString();
         c.drawText(clipped, mx + (mw - fitPaint.measureText(clipped)) / 2f, my + mh - 20 * k, fitPaint);
+    }
+
+    /**
+     * Hit-tests pointer tap coordinates against the active Screensaver Slide Duration modal.
+     */
+    int hitTestSlideDurationModal(float x, float y) {
+        if (sdPanelRect == null || sdPanelRect.isEmpty()) return SD_HIT_NONE;
+        if (!sdPanelRect.contains(x, y)) return SD_HIT_OUTSIDE;
+        if (sdUpArrowRect.contains(x, y)) return SD_HIT_UP;
+        if (sdDownArrowRect.contains(x, y)) return SD_HIT_DOWN;
+        return SD_HIT_NONE;
+    }
+
+    /**
+     * Renders the cyclic Liquid Glass Up/Down Screensaver Slide Duration picker onto {@code toastLayer}
+     * with previous/next peek labels, 17-step progress pips, and auto-saving instant feedback
+     * (zero per-frame heap allocations).
+     */
+    void drawSlideDurationModal(
+            Context ctx,
+            Canvas c,
+            int w,
+            int h,
+            float k,
+            SlideDurationModalState state,
+            Scene scene,
+            int glassBaseColor,
+            float glassBlurMix,
+            boolean isDark,
+            int lInkColor,
+            int lDimColor,
+            int whiteColor,
+            Paint fill,
+            Paint border,
+            Paint lCardTitle,
+            Paint lSubTab,
+            Paint lSubTabOn,
+            TextPaint fitPaint) {
+        if (state == null) return;
+        ensureRectsInitialized();
+
+        fill.setShader(null);
+        fill.setColor(0x9C05070E);
+        c.drawRect(0, 0, w, h, fill);
+
+        int ink = isDark ? whiteColor : lInkColor;
+        int subInk = isDark ? 0xFFD1D1D6 : lDimColor;
+        int invInk = isDark ? lInkColor : whiteColor;
+        int invSub = isDark ? 0xFF48484A : 0xD9FFFFFF;
+        int accent = isDark ? 0xFF34D399 : 0xFF059669;
+
+        float mw = 740f * k;
+        float mh = 444f * k;
+        float mx = (w - mw) / 2f;
+        float my = (h - mh) / 2f;
+        sdPanelRect.set(mx, my, mx + mw, my + mh);
+
+        scene.glass(c, sdPanelRect, 36 * k, glassBaseColor, glassBlurMix, 0xFF6366F1, 0.14f, 0.03f, 1f);
+        border.setColor(isDark ? 0x3CFFFFFF : 0x2C000000);
+        c.drawRoundRect(sdPanelRect, 36 * k, 36 * k, border);
+
+        // Header
+        Symbols.draw(ctx, c, "timer", mx + 54 * k, my + 56 * k, 29 * k, ink);
+        fitPaint.set(lCardTitle);
+        fitPaint.setTextSize(31 * k);
+        fitPaint.setColor(ink);
+        c.drawText(Ui.tr("Slide Duration"), mx + 86 * k, my + 66 * k, fitPaint);
+
+        fitPaint.set(lSubTab);
+        fitPaint.setTextSize(19.5f * k);
+        fitPaint.setColor(subInk);
+        String headerSub = TextUtils.ellipsize(
+                Ui.tr("How long each screensaver photo stays on screen"),
+                fitPaint, mw - 96 * k, TextUtils.TruncateAt.END).toString();
+        c.drawText(headerSub, mx + 48 * k, my + 104 * k, fitPaint);
+
+        // Centered Hero Cyclic Up/Down Wheel Card
+        float cardL = mx + 56 * k;
+        float cardT = my + 128 * k;
+        float cardW = mw - 112 * k;
+        float cardH = 228 * k;
+        float cardR = 26 * k;
+        sdCardRect.set(cardL, cardT, cardL + cardW, cardT + cardH);
+        sdUpArrowRect.set(cardL, cardT, cardL + cardW, cardT + 72 * k);
+        sdDownArrowRect.set(cardL, cardT + cardH - 72 * k, cardL + cardW, cardT + cardH);
+
+        fill.setShader(null);
+        fill.setColor(ink);
+        c.drawRoundRect(sdCardRect, cardR, cardR, fill);
+
+        // Up chevron + Next step peek
+        Symbols.draw(ctx, c, "chevron_up", sdCardRect.centerX(), cardT + 26 * k, 21 * k,
+                Ui.alpha(invInk, 0.88f));
+        fitPaint.set(lSubTab);
+        fitPaint.setTextSize(17.5f * k);
+        fitPaint.setColor(Ui.alpha(invSub, 0.82f));
+        String nextPeek = Ui.tr(state.getNextLabel());
+        c.drawText(nextPeek, sdCardRect.centerX() - fitPaint.measureText(nextPeek) / 2f, cardT + 56 * k, fitPaint);
+
+        // Hero current value
+        String curLabel = Ui.tr(state.getLabel());
+        fitPaint.set(lCardTitle);
+        fitPaint.setTextSize((state.isStaticMode() ? 36f : 48f) * k);
+        fitPaint.setColor(invInk);
+        String clippedCur = TextUtils.ellipsize(curLabel, fitPaint, cardW - 48 * k, TextUtils.TruncateAt.END).toString();
+        c.drawText(clippedCur, sdCardRect.centerX() - fitPaint.measureText(clippedCur) / 2f, cardT + 114 * k, fitPaint);
+
+        // 17-step progress pips showing exact position along cyclic ladder
+        int totalSteps = state.getTotalSteps();
+        int stepIdx = state.getStepIndex();
+        float pipGap = 7f * k;
+        float pipH = 6.5f * k;
+        float pipWNormal = 11f * k;
+        float pipWActive = 26f * k;
+        float totalPipsW = (totalSteps - 1) * pipWNormal + pipWActive + (totalSteps - 1) * pipGap;
+        float px = sdCardRect.centerX() - totalPipsW / 2f;
+        float py = cardT + 136 * k;
+        for (int p = 0; p < totalSteps; p++) {
+            float pw = (p == stepIdx) ? pipWActive : pipWNormal;
+            if (p == stepIdx) {
+                fill.setColor(state.isStaticMode() ? invInk : accent);
+            } else {
+                fill.setColor(Ui.alpha(invInk, 0.22f));
+            }
+            sdScratchRect.set(px, py, px + pw, py + pipH);
+            c.drawRoundRect(sdScratchRect, pipH / 2f, pipH / 2f, fill);
+            px += pw + pipGap;
+        }
+
+        // Previous step peek + Down chevron
+        fitPaint.set(lSubTab);
+        fitPaint.setTextSize(17.5f * k);
+        fitPaint.setColor(Ui.alpha(invSub, 0.82f));
+        String prevPeek = Ui.tr(state.getPrevLabel());
+        c.drawText(prevPeek, sdCardRect.centerX() - fitPaint.measureText(prevPeek) / 2f, cardT + cardH - 42 * k, fitPaint);
+        Symbols.draw(ctx, c, "chevron_down", sdCardRect.centerX(), cardT + cardH - 22 * k, 21 * k,
+                Ui.alpha(invInk, 0.88f));
+
+        // Explanatory status caption below card
+        fitPaint.set(lSubTabOn);
+        fitPaint.setTextSize(19 * k);
+        fitPaint.setColor(ink);
+        String caption = TextUtils.ellipsize(
+                Ui.tr(state.getCaption()), fitPaint, mw - 96 * k, TextUtils.TruncateAt.END).toString();
+        c.drawText(caption, sdPanelRect.centerX() - fitPaint.measureText(caption) / 2f, cardT + cardH + 34 * k, fitPaint);
+
+        // Footer hint
+        fitPaint.set(lSubTab);
+        fitPaint.setTextSize(17.5f * k);
+        fitPaint.setColor(subInk);
+        String footer = TextUtils.ellipsize(
+                Ui.tr("Up / Down Change duration  \u00B7  OK or Back Done"),
+                fitPaint, mw - 72 * k, TextUtils.TruncateAt.END).toString();
+        c.drawText(footer, sdPanelRect.centerX() - fitPaint.measureText(footer) / 2f, my + mh - 20 * k, fitPaint);
     }
 
     /**

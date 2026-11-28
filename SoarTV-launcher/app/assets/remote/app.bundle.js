@@ -348,6 +348,141 @@
         ].join('\n');
     }
     /**
+     * Bidirectional Supabase Realtime Phoenix v1 WebSocket bridge for controlling LG webOS and Samsung Tizen TVs
+     * directly from the Companion Phone Remote (matching `SoarTV-launcher/web/services.js` `SupabaseService`).
+     */
+    class RealtimeTvRemoteBridge {
+        constructor(creds, channelCode, options) {
+            this.socket = null;
+            this.heartbeatTimer = null;
+            this.refCounter = 1;
+            this.joined = false;
+            this.creds = creds;
+            this.channelCode = channelCode.trim();
+            this.onStatusChange = options?.onStatusChange ?? null;
+            this.wsFactory =
+                options?.wsFactory ?? ((url) => new WebSocket(url));
+        }
+        static buildRealtimeWsUrl(supabaseUrl, anonKey) {
+            const clean = TvRemoteService.normalizeBaseUrl(supabaseUrl);
+            if (!clean || !anonKey.trim())
+                return '';
+            const wsBase = clean.replace(/^https:\/\//i, 'wss://').replace(/^http:\/\//i, 'ws://');
+            return `${wsBase}/realtime/v1/websocket?apikey=${encodeURIComponent(anonKey.trim())}&vsn=1.0.0`;
+        }
+        getTopic() {
+            return `realtime:soartv-remote:${this.channelCode}`;
+        }
+        isConnected() {
+            return this.joined && this.socket !== null && this.socket.readyState === 1;
+        }
+        connect() {
+            this.disconnect();
+            const url = RealtimeTvRemoteBridge.buildRealtimeWsUrl(this.creds.supabaseUrl, this.creds.supabaseAnonKey);
+            if (!url || !this.channelCode)
+                return;
+            try {
+                const ws = this.wsFactory(url);
+                this.socket = ws;
+                ws.onopen = () => {
+                    ws.send(JSON.stringify({
+                        topic: this.getTopic(),
+                        event: 'phx_join',
+                        payload: { config: { broadcast: { ack: false, self: false } } },
+                        ref: String(this.refCounter++),
+                    }));
+                    this.heartbeatTimer = setInterval(() => {
+                        if (this.socket && this.socket.readyState === 1) {
+                            this.socket.send(JSON.stringify({
+                                topic: 'phoenix',
+                                event: 'heartbeat',
+                                payload: {},
+                                ref: String(this.refCounter++),
+                            }));
+                        }
+                    }, 25000);
+                };
+                ws.onmessage = (ev) => {
+                    try {
+                        const parsed = JSON.parse(String(ev.data || '{}'));
+                        if (parsed.event === 'phx_reply' && parsed.payload?.status === 'ok') {
+                            this.joined = true;
+                            this.onStatusChange?.(true);
+                        }
+                    }
+                    catch {
+                        // Ignore malformed frame
+                    }
+                };
+                ws.onerror = () => {
+                    this.joined = false;
+                    this.onStatusChange?.(false);
+                };
+                ws.onclose = () => {
+                    this.joined = false;
+                    if (this.heartbeatTimer) {
+                        clearInterval(this.heartbeatTimer);
+                        this.heartbeatTimer = null;
+                    }
+                    this.onStatusChange?.(false);
+                };
+            }
+            catch {
+                this.joined = false;
+                this.onStatusChange?.(false);
+            }
+        }
+        disconnect() {
+            this.joined = false;
+            if (this.heartbeatTimer) {
+                clearInterval(this.heartbeatTimer);
+                this.heartbeatTimer = null;
+            }
+            if (this.socket) {
+                try {
+                    this.socket.onopen = null;
+                    this.socket.onmessage = null;
+                    this.socket.onerror = null;
+                    this.socket.onclose = null;
+                    this.socket.close();
+                }
+                catch {
+                    // Ignore close errors
+                }
+                this.socket = null;
+            }
+        }
+        sendRemoteCommand(command) {
+            if (!this.socket || this.socket.readyState !== 1)
+                return false;
+            try {
+                this.socket.send(JSON.stringify({
+                    topic: this.getTopic(),
+                    event: 'broadcast',
+                    payload: {
+                        type: 'broadcast',
+                        event: 'remote_command',
+                        payload: command,
+                    },
+                    ref: String(this.refCounter++),
+                }));
+                return true;
+            }
+            catch {
+                return false;
+            }
+        }
+        sendKey(key) {
+            return this.sendRemoteCommand({ type: 'key', key });
+        }
+        sendText(text, ai = false) {
+            return this.sendRemoteCommand({ type: 'text', text: text.trim(), ai });
+        }
+        switchProfile(slug) {
+            return this.sendRemoteCommand({ type: 'profile', slug: slug.trim() });
+        }
+    }
+    /**
      * Thrown when a protected Companion Remote endpoint returns HTTP 401 (unpaired, revoked, or 30-day Guest expired).
      */
     class RemoteUnauthorizedError extends Error {
@@ -552,6 +687,145 @@
                 if (found) {
                     return found;
                 }
+            }
+            return null;
+        }
+        /**
+         * Returns `true` when the target TV is an LG webOS or Samsung Tizen web launcher controlled via
+         * Supabase Realtime instead of an Android TV embedded HTTP server on port 8484.
+         */
+        static isWebRealtimeTv(tv) {
+            if (!tv)
+                return false;
+            const plat = (tv.platform || '').toLowerCase();
+            return plat === 'lg-webos' || plat === 'samsung-tizen' || (!tv.lanIp && Boolean(tv.realtimeChannel));
+        }
+        /**
+         * Builds `http://<lanIp>:<port>` for an Android TV directory entry, or `""` when no LAN IP is stored.
+         */
+        static buildTvBaseUrl(tv) {
+            if (!tv || !tv.lanIp.trim())
+                return '';
+            const port = tv.remotePort > 0 && tv.remotePort <= 65535 ? tv.remotePort : 8484;
+            return TvRemoteService.normalizeHostInput(`${tv.lanIp.trim()}:${port}`, port);
+        }
+        /**
+         * Fetches all active household TVs from Supabase `public.tv_devices` using explicit column projection
+         * (authorized ONLY for ADMIN and HOUSEHOLD remotes that possess `householdKey`).
+         */
+        static async fetchHouseholdTvDevices(creds, fetchImpl, timeoutMs = 3500) {
+            const cleanUrl = TvRemoteService.normalizeBaseUrl(creds.supabaseUrl || '');
+            const anonKey = (creds.supabaseAnonKey || '').trim();
+            const householdKey = (creds.householdKey || '').trim();
+            if (!cleanUrl || !anonKey || !householdKey)
+                return [];
+            const selectCols = 'device_id,device_name,room_name,platform,brand,model,lan_ip,remote_port,mdns_host,realtime_channel,last_seen_at';
+            const endpoint = `${cleanUrl}/rest/v1/tv_devices?select=${selectCols}&is_active=eq.true&order=last_seen_at.desc`;
+            const baseFetch = fetchImpl ?? ((url, init) => fetch(url, init));
+            const timedFetch = TvRemoteService.createTimeoutFetch(baseFetch, timeoutMs);
+            try {
+                const res = await timedFetch(endpoint, {
+                    method: 'GET',
+                    headers: {
+                        apikey: anonKey,
+                        Authorization: `Bearer ${anonKey}`,
+                        'x-soartv-household-key': householdKey,
+                        Accept: 'application/json',
+                    },
+                });
+                if (!res.ok)
+                    return [];
+                const rows = (await res.json());
+                if (!Array.isArray(rows))
+                    return [];
+                const out = [];
+                for (const r of rows) {
+                    const deviceId = String(r.device_id || r.device_slug || '').trim();
+                    if (!deviceId)
+                        continue;
+                    const portNum = Number(r.remote_port);
+                    out.push({
+                        deviceId,
+                        deviceName: String(r.device_name || deviceId).trim(),
+                        roomName: String(r.room_name || '').trim(),
+                        platform: String(r.platform || 'android-tv').trim(),
+                        brand: String(r.brand || '').trim(),
+                        model: String(r.model || '').trim(),
+                        lanIp: String(r.lan_ip || '').trim(),
+                        remotePort: Number.isFinite(portNum) && portNum > 0 ? portNum : 8484,
+                        mdnsHost: String(r.mdns_host || '').trim(),
+                        realtimeChannel: String(r.realtime_channel || '').trim(),
+                        lastSeenAt: String(r.last_seen_at || '').trim(),
+                    });
+                }
+                return out;
+            }
+            catch {
+                return [];
+            }
+        }
+        /**
+         * Self-healing multi-TV reconnect cascade:
+         * 1. LG webOS / Samsung Tizen TVs -> Supabase Realtime channel
+         * 2. Cached LAN IP probe
+         * 3. Fresh LAN IP pulled from Supabase `tv_devices` directory (survives any router/DHCP IP change!)
+         * 4. Local mDNS hostname (`soartv-<name>.local`)
+         * 5. Offline LAN UDP broadcast + `/24` scan (`discoverLanTv`)
+         */
+        static async resolveReachableTv(activeTv, currentBaseUrl, creds, fetchImpl) {
+            if (activeTv && TvRemoteService.isWebRealtimeTv(activeTv) && creds?.supabaseUrl && creds?.supabaseAnonKey) {
+                return {
+                    mode: 'realtime',
+                    baseUrl: '',
+                    tv: activeTv,
+                    source: 'realtime',
+                };
+            }
+            // Step 1: Cached LAN URL
+            const cleanCurrent = TvRemoteService.normalizeHostInput(currentBaseUrl || '');
+            if (cleanCurrent) {
+                const hit = await TvRemoteService.probeLanTv([cleanCurrent], fetchImpl, 900);
+                if (hit) {
+                    return { mode: 'lan', baseUrl: hit, tv: activeTv, source: 'cached' };
+                }
+            }
+            // Step 2: Fresh LAN IP from Supabase `tv_devices`
+            let matchedTv = activeTv;
+            if (creds && creds.supabaseUrl && creds.supabaseAnonKey && creds.householdKey) {
+                const freshTvs = await TvRemoteService.fetchHouseholdTvDevices(creds, fetchImpl, 3000);
+                if (freshTvs.length > 0) {
+                    if (activeTv) {
+                        matchedTv = freshTvs.find((t) => t.deviceId === activeTv.deviceId) ?? activeTv;
+                    }
+                    else {
+                        matchedTv = freshTvs.find((t) => !TvRemoteService.isWebRealtimeTv(t)) ?? freshTvs[0];
+                    }
+                    if (matchedTv && TvRemoteService.isWebRealtimeTv(matchedTv)) {
+                        return { mode: 'realtime', baseUrl: '', tv: matchedTv, source: 'realtime' };
+                    }
+                    const freshUrl = TvRemoteService.buildTvBaseUrl(matchedTv);
+                    if (freshUrl && freshUrl !== cleanCurrent) {
+                        const hit = await TvRemoteService.probeLanTv([freshUrl], fetchImpl, 1200);
+                        if (hit) {
+                            return { mode: 'lan', baseUrl: hit, tv: matchedTv, source: 'supabase_lan' };
+                        }
+                    }
+                }
+            }
+            // Step 3: Local mDNS hostname
+            if (matchedTv && matchedTv.mdnsHost) {
+                const mdnsUrl = TvRemoteService.normalizeHostInput(`${matchedTv.mdnsHost}:${matchedTv.remotePort || 8484}`, matchedTv.remotePort || 8484);
+                if (mdnsUrl) {
+                    const hit = await TvRemoteService.probeLanTv([mdnsUrl], fetchImpl, 900);
+                    if (hit) {
+                        return { mode: 'lan', baseUrl: hit, tv: matchedTv, source: 'mdns' };
+                    }
+                }
+            }
+            // Step 4: Offline LAN UDP / subnet discovery
+            const lanFound = await TvRemoteService.discoverLanTv(cleanCurrent, fetchImpl, 6, 650);
+            if (lanFound) {
+                return { mode: 'lan', baseUrl: lanFound, tv: matchedTv, source: 'udp_lan' };
             }
             return null;
         }
@@ -1319,6 +1593,11 @@
     const STORAGE_ROLE = 'soartv_remote_role';
     const STORAGE_CLIENT_ID = 'soartv_client_id';
     const STORAGE_PAD_MODE = 'soartv_pad_mode';
+    const STORAGE_SUPABASE_URL = 'soartv_hh_supabase_url';
+    const STORAGE_SUPABASE_ANON = 'soartv_hh_supabase_anon';
+    const STORAGE_HOUSEHOLD_KEY = 'soartv_hh_key';
+    const STORAGE_ACTIVE_TV_ID = 'soartv_active_tv_id';
+    const STORAGE_KNOWN_TVS = 'soartv_known_tvs';
     const SCREEN_NAMES = ['Search', 'Home', 'Apps', 'Gaming', 'Reels', 'Smart-Home', 'Settings'];
     const nativeBridge = typeof window !== 'undefined' ? window.SoarTvNative || window.SoarTvNativeRemote : undefined;
     const IS_NATIVE_APK = typeof window !== 'undefined' &&
@@ -1401,6 +1680,243 @@
     let lastUsersSig = '';
     let lastGamingSig = '';
     let lastAdminDevicesSig = '';
+    let knownHouseholdTvs = loadCachedHouseholdTvs();
+    let activeTvDeviceId = readStorage(STORAGE_ACTIVE_TV_ID);
+    let activeRealtimeBridge = null;
+    let activeRealtimeTv = null;
+    function loadCachedHouseholdTvs() {
+        try {
+            const raw = readStorage(STORAGE_KNOWN_TVS);
+            if (!raw)
+                return [];
+            const parsed = JSON.parse(raw);
+            return Array.isArray(parsed) ? parsed : [];
+        }
+        catch {
+            return [];
+        }
+    }
+    function saveCachedHouseholdTvs(list) {
+        knownHouseholdTvs = list;
+        try {
+            writeStorage(STORAGE_KNOWN_TVS, JSON.stringify(list));
+        }
+        catch {
+            // Ignore quota errors
+        }
+    }
+    function getHouseholdDirectoryCreds() {
+        if (currentRole !== 'ADMIN' && currentRole !== 'HOUSEHOLD') {
+            return null;
+        }
+        const supabaseUrl = readStorage(STORAGE_SUPABASE_URL);
+        const supabaseAnonKey = readStorage(STORAGE_SUPABASE_ANON);
+        const householdKey = readStorage(STORAGE_HOUSEHOLD_KEY);
+        if (!supabaseUrl || !supabaseAnonKey || !householdKey) {
+            return null;
+        }
+        return { supabaseUrl, supabaseAnonKey, householdKey };
+    }
+    function persistHouseholdDirectoryCreds(cfg) {
+        if (!cfg)
+            return;
+        if (cfg.tvDeviceId) {
+            activeTvDeviceId = cfg.tvDeviceId;
+            writeStorage(STORAGE_ACTIVE_TV_ID, cfg.tvDeviceId);
+        }
+        if (cfg.role === 'ADMIN' || cfg.role === 'HOUSEHOLD') {
+            if (cfg.supabaseUrl && cfg.supabaseAnonKey && cfg.householdKey) {
+                writeStorage(STORAGE_SUPABASE_URL, cfg.supabaseUrl);
+                writeStorage(STORAGE_SUPABASE_ANON, cfg.supabaseAnonKey);
+                writeStorage(STORAGE_HOUSEHOLD_KEY, cfg.householdKey);
+            }
+        }
+        else if (cfg.role === 'GUEST') {
+            // Security boundary: Guest (30-day) remotes NEVER retain household cloud directory keys
+            writeStorage(STORAGE_SUPABASE_ANON, '');
+            writeStorage(STORAGE_HOUSEHOLD_KEY, '');
+        }
+    }
+    function clearHouseholdDirectoryCreds() {
+        writeStorage(STORAGE_SUPABASE_URL, '');
+        writeStorage(STORAGE_SUPABASE_ANON, '');
+        writeStorage(STORAGE_HOUSEHOLD_KEY, '');
+    }
+    function formatTvPlatformBadge(tv) {
+        const plat = (tv.platform || '').toLowerCase();
+        if (plat === 'lg-webos')
+            return 'LG webOS';
+        if (plat === 'samsung-tizen')
+            return 'Samsung Tizen';
+        return tv.brand ? tv.brand : 'Android TV';
+    }
+    function renderHouseholdTvSwitcher() {
+        const section = document.getElementById('householdTvsSection');
+        const listEl = document.getElementById('householdTvsList');
+        if (!section || !listEl)
+            return;
+        if (knownHouseholdTvs.length <= 1) {
+            section.style.display = 'none';
+            return;
+        }
+        section.style.display = 'flex';
+        listEl.innerHTML = knownHouseholdTvs
+            .map((tv) => {
+            const isActive = (activeRealtimeTv && activeRealtimeTv.deviceId === tv.deviceId) ||
+                (!activeRealtimeTv &&
+                    (tv.deviceId === activeTvDeviceId ||
+                        (Boolean(tv.lanIp) && TvRemoteService.buildTvBaseUrl(tv) === remoteService.getBaseUrl())));
+            const subParts = [];
+            if (tv.roomName)
+                subParts.push(tv.roomName);
+            if (TvRemoteService.isWebRealtimeTv(tv)) {
+                subParts.push('Cloud Realtime');
+            }
+            else if (tv.lanIp) {
+                subParts.push(tv.lanIp);
+            }
+            const badge = formatTvPlatformBadge(tv);
+            return `<button class="household-tv-row${isActive ? ' active' : ''}" onclick="selectHouseholdTv('${escapeAttr(tv.deviceId)}')">
+        <span class="household-tv-meta">
+          <span class="household-tv-name">${escapeHtml(tv.deviceName || tv.deviceId)}</span>
+          <span class="household-tv-sub">${escapeHtml(subParts.join(' · ') || 'Household TV')}</span>
+        </span>
+        <span class="household-tv-badge">${escapeHtml(badge)}</span>
+      </button>`;
+        })
+            .join('');
+    }
+    async function refreshHouseholdTvDirectory(showFeedback = false) {
+        const mergedById = new Map();
+        for (const prev of knownHouseholdTvs) {
+            if (prev.deviceId)
+                mergedById.set(prev.deviceId, prev);
+        }
+        // 1. Pull household directory from Supabase (ADMIN / HOUSEHOLD only)
+        const creds = getHouseholdDirectoryCreds();
+        if (creds) {
+            const cloudTvs = await TvRemoteService.fetchHouseholdTvDevices(creds);
+            for (const tv of cloudTvs) {
+                mergedById.set(tv.deviceId, tv);
+            }
+        }
+        // 2. Merge instant native LAN UDP discovery replies (works 100% offline!)
+        if (nativeBridge && typeof nativeBridge.discoverAllTvsOnLan === 'function') {
+            try {
+                const raw = nativeBridge.discoverAllTvsOnLan();
+                const udpList = JSON.parse(raw || '[]');
+                if (Array.isArray(udpList)) {
+                    for (const item of udpList) {
+                        const id = String(item.deviceId || '').trim();
+                        const lanIp = String(item.lanIp || '').trim();
+                        if (!id || !lanIp)
+                            continue;
+                        const prev = mergedById.get(id);
+                        mergedById.set(id, {
+                            deviceId: id,
+                            deviceName: String(item.deviceName || prev?.deviceName || 'SoarTV'),
+                            roomName: String(item.roomName || prev?.roomName || ''),
+                            platform: String(item.platform || prev?.platform || 'android-tv'),
+                            brand: String(item.brand || prev?.brand || ''),
+                            model: String(item.model || prev?.model || ''),
+                            lanIp,
+                            remotePort: Number(item.port) || prev?.remotePort || 8484,
+                            mdnsHost: String(item.mdnsHost || prev?.mdnsHost || ''),
+                            realtimeChannel: prev?.realtimeChannel || '',
+                            lastSeenAt: new Date().toISOString(),
+                        });
+                    }
+                }
+            }
+            catch {
+                // Ignore native bridge parse failures
+            }
+        }
+        // 3. Ensure currently connected TV is represented
+        if (currentAuthConfig?.tvDeviceId) {
+            const existing = mergedById.get(currentAuthConfig.tvDeviceId);
+            const curBase = remoteService.getBaseUrl();
+            const curHostMatch = curBase.match(/^https?:\/\/([^:/]+)/i);
+            mergedById.set(currentAuthConfig.tvDeviceId, {
+                deviceId: currentAuthConfig.tvDeviceId,
+                deviceName: currentAuthConfig.tvName || existing?.deviceName || 'SoarTV',
+                roomName: currentAuthConfig.tvRoom || existing?.roomName || '',
+                platform: currentAuthConfig.tvPlatform || existing?.platform || 'android-tv',
+                brand: currentAuthConfig.tvBrand || existing?.brand || '',
+                model: existing?.model || '',
+                lanIp: (curHostMatch ? curHostMatch[1] : '') || existing?.lanIp || '',
+                remotePort: existing?.remotePort || 8484,
+                mdnsHost: currentAuthConfig.mdnsHost || existing?.mdnsHost || '',
+                realtimeChannel: existing?.realtimeChannel || '',
+                lastSeenAt: new Date().toISOString(),
+            });
+        }
+        saveCachedHouseholdTvs(Array.from(mergedById.values()));
+        renderHouseholdTvSwitcher();
+        if (showFeedback) {
+            showToast(`Found ${knownHouseholdTvs.length} household TV${knownHouseholdTvs.length === 1 ? '' : 's'}`);
+        }
+    }
+    async function selectHouseholdTv(deviceId) {
+        const target = knownHouseholdTvs.find((t) => t.deviceId === deviceId);
+        if (!target)
+            return;
+        activeTvDeviceId = target.deviceId;
+        writeStorage(STORAGE_ACTIVE_TV_ID, target.deviceId);
+        if (activeRealtimeBridge) {
+            activeRealtimeBridge.disconnect();
+            activeRealtimeBridge = null;
+            activeRealtimeTv = null;
+        }
+        if (TvRemoteService.isWebRealtimeTv(target)) {
+            const creds = getHouseholdDirectoryCreds();
+            const channel = target.realtimeChannel || target.deviceId;
+            if (!creds || !channel) {
+                showToast('Cloud Realtime credentials required for LG / Samsung TVs');
+                return;
+            }
+            activeRealtimeTv = target;
+            activeRealtimeBridge = new RealtimeTvRemoteBridge(creds, channel, {
+                onStatusChange: (connected) => {
+                    document.getElementById('statusDot')?.classList.toggle('offline', !connected);
+                },
+            });
+            activeRealtimeBridge.connect();
+            const tvModelEl = document.getElementById('tvModelText');
+            const tvSubEl = document.getElementById('tvSubText');
+            const pillText = document.getElementById('tvPillName');
+            if (tvModelEl)
+                tvModelEl.textContent = target.deviceName;
+            if (tvSubEl)
+                tvSubEl.textContent = `${target.roomName || formatTvPlatformBadge(target)} · Cloud Realtime`;
+            if (pillText)
+                pillText.textContent = target.deviceName;
+            renderHouseholdTvSwitcher();
+            closeSheet('screens');
+            showToast(`Switched to ${target.deviceName}`);
+            return;
+        }
+        const nextUrl = TvRemoteService.buildTvBaseUrl(target);
+        if (!nextUrl) {
+            showToast(`Locating ${target.deviceName}...`);
+            const resolved = await TvRemoteService.resolveReachableTv(target, '', getHouseholdDirectoryCreds());
+            if (!resolved || !resolved.baseUrl) {
+                showToast(`Could not reach ${target.deviceName} on Wi-Fi`);
+                return;
+            }
+            remoteService.setBaseUrl(resolved.baseUrl);
+            writeStorage(STORAGE_BASE_URL, resolved.baseUrl);
+        }
+        else {
+            remoteService.setBaseUrl(nextUrl);
+            writeStorage(STORAGE_BASE_URL, nextUrl);
+        }
+        syncApkDownloadLinks();
+        renderHouseholdTvSwitcher();
+        closeSheet('screens');
+        showToast(`Switched to ${target.deviceName}`);
+        await bootstrapConnectionAndAuth();
+    }
     const initialBaseUrl = typeof window !== 'undefined'
         ? TvRemoteService.resolveDynamicBaseUrl(window.location, readStorage(STORAGE_BASE_URL))
         : '';
@@ -1606,6 +2122,7 @@
         remoteService.setAuthToken('');
         writeStorage(STORAGE_TOKEN, '');
         writeStorage(STORAGE_ROLE, '');
+        clearHouseholdDirectoryCreds();
         applyRoleVisibility('');
         setPairingOverlayVisible(true);
         renderGoogleAuthAvailability(currentAuthConfig);
@@ -1876,6 +2393,7 @@
         remoteService.setAuthToken('');
         writeStorage(STORAGE_TOKEN, '');
         writeStorage(STORAGE_ROLE, '');
+        clearHouseholdDirectoryCreds();
         applyRoleVisibility('');
         updateFastInputPollingState();
         setPairingOverlayVisible(true);
@@ -1937,6 +2455,20 @@
                 ? 'Paired as Household Member'
                 : 'Paired as Guest (30 Days)');
         await refreshStatus();
+        if (role === 'ADMIN' || role === 'HOUSEHOLD') {
+            try {
+                const freshCfg = await remoteService.getAuthConfig();
+                currentAuthConfig = freshCfg;
+                persistHouseholdDirectoryCreds(freshCfg);
+                void refreshHouseholdTvDirectory(false);
+            }
+            catch {
+                // Non-fatal
+            }
+        }
+        else {
+            clearHouseholdDirectoryCreds();
+        }
         updateFastInputPollingState();
         void wakeTvOnRemoteActivity();
         void loadGamingZone(false);
@@ -2115,6 +2647,7 @@
             }
             const cfg = await remoteService.getAuthConfig();
             currentAuthConfig = cfg;
+            persistHouseholdDirectoryCreds(cfg);
             renderGoogleAuthAvailability(cfg);
             if (cfg.paired && cfg.role) {
                 isPaired = true;
@@ -2124,6 +2657,7 @@
                 updateFastInputPollingState();
                 void wakeTvOnRemoteActivity();
                 await refreshStatus();
+                void refreshHouseholdTvDirectory(false);
                 void loadGamingZone(false);
                 if (cfg.role === 'ADMIN') {
                     void refreshPairedDevices();
@@ -2138,12 +2672,13 @@
         }
         catch {
             document.getElementById('statusDot')?.classList.add('offline');
-            // Cached TV address may be stale after power-cycle or DHCP change: auto-discover live TV on Wi-Fi
+            // Cached TV address may be stale after power-cycle or DHCP change: self-heal via Supabase tv_devices -> mDNS -> UDP/LAN
             const previousUrl = remoteService.getBaseUrl();
-            const recoveredUrl = await TvRemoteService.discoverLanTv(previousUrl);
-            if (recoveredUrl && recoveredUrl !== previousUrl) {
-                remoteService.setBaseUrl(recoveredUrl);
-                writeStorage(STORAGE_BASE_URL, recoveredUrl);
+            const activeKnown = knownHouseholdTvs.find((t) => t.deviceId === activeTvDeviceId) || null;
+            const resolved = await TvRemoteService.resolveReachableTv(activeKnown, previousUrl, getHouseholdDirectoryCreds());
+            if (resolved && resolved.mode === 'lan' && resolved.baseUrl && resolved.baseUrl !== previousUrl) {
+                remoteService.setBaseUrl(resolved.baseUrl);
+                writeStorage(STORAGE_BASE_URL, resolved.baseUrl);
                 syncApkDownloadLinks();
                 void bootstrapConnectionAndAuth();
                 return;
@@ -2693,6 +3228,10 @@
     async function sendKey(key) {
         if (typeof navigator !== 'undefined' && navigator.vibrate) {
             navigator.vibrate(key === 'hold_ok' ? [18, 30, 18] : 10);
+        }
+        if (activeRealtimeBridge) {
+            activeRealtimeBridge.sendKey(key);
+            return;
         }
         const ok = await remoteService.sendKey(key);
         if (!ok && !isPaired)
@@ -3762,6 +4301,8 @@
     let consecutiveOfflinePolls = 0;
     let lanRecoveryInFlight = false;
     async function refreshStatus() {
+        if (activeRealtimeBridge)
+            return;
         if (!isPaired || !remoteService.getBaseUrl())
             return;
         try {
@@ -3775,11 +4316,15 @@
                 consecutiveOfflinePolls++;
                 if (consecutiveOfflinePolls >= 2 && !lanRecoveryInFlight) {
                     lanRecoveryInFlight = true;
-                    void TvRemoteService.discoverLanTv(remoteService.getBaseUrl())
-                        .then((found) => {
-                        if (found && found !== remoteService.getBaseUrl()) {
-                            remoteService.setBaseUrl(found);
-                            writeStorage(STORAGE_BASE_URL, found);
+                    const activeKnown = knownHouseholdTvs.find((t) => t.deviceId === activeTvDeviceId) || null;
+                    void TvRemoteService.resolveReachableTv(activeKnown, remoteService.getBaseUrl(), getHouseholdDirectoryCreds())
+                        .then((resolved) => {
+                        if (resolved &&
+                            resolved.mode === 'lan' &&
+                            resolved.baseUrl &&
+                            resolved.baseUrl !== remoteService.getBaseUrl()) {
+                            remoteService.setBaseUrl(resolved.baseUrl);
+                            writeStorage(STORAGE_BASE_URL, resolved.baseUrl);
                             syncApkDownloadLinks();
                             consecutiveOfflinePolls = 0;
                             showToast('Reconnected to SoarTV');
@@ -3923,6 +4468,8 @@
             switchTab,
             switchTvScreen,
             switchSubTab,
+            selectHouseholdTv,
+            refreshHouseholdTvDirectory,
             sendKey,
             submitText,
             clearTvInputField,

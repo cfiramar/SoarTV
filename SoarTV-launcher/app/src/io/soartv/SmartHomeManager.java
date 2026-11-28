@@ -371,6 +371,74 @@ public final class SmartHomeManager {
                 .edit()
                 .putString("discovered_wiz_bulbs", arr.toString())
                 .apply();
+        try {
+            CloudSyncManager.get(appContext).recordLocalFieldChange(CloudSyncManager.Scope.HOUSEHOLD, "wiz_bulbs");
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    /** Exports discovered WiZ bulb MAC -> {name, room} mappings for Household Cloud Sync (zero static IPs). */
+    public synchronized Map<String, Object> exportWizBulbRegistryForCloud() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Device d : devices) {
+            if (d.getProtocol() == Protocol.WIZ_LIGHT && d.getMacAddress() != null && !d.getMacAddress().isEmpty()) {
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("name", d.getName());
+                out.put(d.getMacAddress().toLowerCase(Locale.ROOT), entry);
+            }
+        }
+        return out;
+    }
+
+    /** Imports household-synced WiZ bulb MAC -> {name} mappings so new TVs instantly recognize bulbs by MAC. */
+    public synchronized void importWizBulbRegistryFromCloud(Map<String, Object> wizMap) {
+        if (appContext == null || wizMap == null || wizMap.isEmpty()) return;
+        SharedPreferences prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        SharedPreferences.Editor ed = prefs.edit();
+        for (Map.Entry<String, Object> e : wizMap.entrySet()) {
+            String mac = e.getKey() == null ? "" : e.getKey().trim().toLowerCase(Locale.ROOT);
+            if (mac.isEmpty()) continue;
+            Map<String, Object> meta = CloudVaultCrypto.JsonCodec.optObjectMap(wizMap, e.getKey());
+            String name = CloudVaultCrypto.JsonCodec.optString(meta, "name", "");
+            if (!name.isEmpty()) {
+                String devId = "wiz_bulb_" + mac;
+                ed.putString("name:" + devId, name);
+                Device existing = findDevice(devId);
+                if (existing != null) {
+                    existing.setName(name);
+                } else {
+                    addOrUpdateWizBulbDevice(mac, discoveredWizIps.getOrDefault(mac, ""), name, false, 100, 2700);
+                }
+            }
+        }
+        ed.apply();
+    }
+
+    /** Exports user-created smart-home room names for Household Cloud Sync. */
+    public List<String> exportCustomRoomsForCloud() {
+        List<String> out = new ArrayList<>();
+        if (appContext == null) return out;
+        String raw = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString("custom_rooms", "");
+        if (raw != null && !raw.trim().isEmpty()) {
+            for (String part : raw.split("\\|")) {
+                String r = part.trim();
+                if (!r.isEmpty() && !out.contains(r)) out.add(r);
+            }
+        }
+        return out;
+    }
+
+    /** Imports household-synced custom room names locally. */
+    public void importCustomRoomsFromCloud(List<String> rooms) {
+        if (appContext == null || rooms == null) return;
+        StringBuilder sb = new StringBuilder();
+        for (String r : rooms) {
+            if (r == null || r.trim().isEmpty()) continue;
+            if (sb.length() > 0) sb.append('|');
+            sb.append(r.trim());
+        }
+        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putString("custom_rooms", sb.toString()).apply();
     }
 
     /** @return Unmodifiable list of all Smart Home devices. */
@@ -824,9 +892,21 @@ public final class SmartHomeManager {
     }
 
     /**
-     * Persists the room where this TV is located (e.g., {@code "Living Room"}, {@code "Bedroom"}).
+     * Persists the room where this TV is located (e.g., {@code "Living Room"}, {@code "Bedroom"})
+     * and schedules a Tier 3 TV-device cloud push.
      */
     public void setTvRoom(String room) {
+        setTvRoomQuietly(room);
+        if (appContext != null) {
+            try {
+                CloudSyncManager.get(appContext).recordLocalFieldChange(CloudSyncManager.Scope.TV_DEVICE, "room_name");
+            } catch (RuntimeException ignored) {
+            }
+        }
+    }
+
+    /** Persists the room where this TV is located without triggering a cloud push (used when applying remote sync). */
+    public void setTvRoomQuietly(String room) {
         if (appContext == null || room == null || room.trim().isEmpty()) return;
         appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit()
@@ -1516,9 +1596,122 @@ public final class SmartHomeManager {
         return "";
     }
 
+    /** Switcher V2/V3/Touch UDP broadcast port (20002) and V4/Breeze port (20003). */
+    public static final int SWITCHER_UDP_PORT_V2 = 20002;
+    public static final int SWITCHER_UDP_PORT_V4 = 20003;
+
+    /** Immutable discovery result parsed from a Switcher LAN UDP broadcast packet. */
+    public static final class SwitcherDiscovery {
+        public final String deviceId;
+        public final String lanIp;
+
+        public SwitcherDiscovery(String deviceId, String lanIp) {
+            this.deviceId = deviceId == null ? "" : deviceId.trim().toLowerCase(Locale.ROOT);
+            this.lanIp = lanIp == null ? "" : lanIp.trim();
+        }
+    }
+
+    /**
+     * Pure static parser for Switcher V2/V3/V4 local UDP status broadcasts (magic header {@code 0xFE 0xF0},
+     * 3-byte hardware device ID at offset {@code 18..20}). Safe for headless JVM testing.
+     *
+     * @param data     Raw UDP payload bytes.
+     * @param len      Valid byte length in {@code data}.
+     * @param senderIp Source IPv4 address of the UDP packet.
+     * @return Parsed {@link SwitcherDiscovery}, or {@code null} for non-Switcher packets.
+     */
+    public static SwitcherDiscovery parseSwitcherBroadcastPacket(byte[] data, int len, String senderIp) {
+        if (data == null || len < 76 || senderIp == null || senderIp.trim().isEmpty()) return null;
+        if ((data[0] & 0xFF) != 0xFE || (data[1] & 0xFF) != 0xF0) return null;
+        StringBuilder devIdHex = new StringBuilder(6);
+        for (int i = 18; i < 21; i++) {
+            devIdHex.append(String.format(Locale.ROOT, "%02x", data[i] & 0xFF));
+        }
+        String devId = devIdHex.toString();
+        if ("000000".equals(devId)) return null;
+        return new SwitcherDiscovery(devId, senderIp.trim());
+    }
+
+    /** Returns the persisted hardware Switcher Device ID (never relies on static IP). */
+    public String getSwitcherDeviceId() {
+        if (appContext != null) {
+            String saved = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .getString("switcher_device_id", "").trim();
+            if (!saved.isEmpty()) return saved;
+        }
+        return Config.SWITCHER_DEVICE_ID != null ? Config.SWITCHER_DEVICE_ID.trim() : "";
+    }
+
+    /** Persists the Switcher hardware Device ID (synced via Household settings). */
+    public void setSwitcherDeviceId(String deviceId) {
+        if (appContext == null || deviceId == null || deviceId.trim().isEmpty()) return;
+        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putString("switcher_device_id", deviceId.trim().toLowerCase(Locale.ROOT)).apply();
+    }
+
+    /** Returns the latest auto-discovered LAN IP for the Switcher boiler (empty if not yet heard on LAN). */
+    public String getSwitcherLanIp() {
+        if (appContext != null) {
+            String saved = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .getString("switcher_lan_ip", "").trim();
+            if (!saved.isEmpty()) return saved;
+        }
+        return Config.SWITCHER_DEVICE_IP != null ? Config.SWITCHER_DEVICE_IP.trim() : "";
+    }
+
+    /**
+     * Passively listens on UDP port {@code 20002} (and {@code 20003} fallback) for Switcher boiler
+     * broadcast packets, matching by hardware Device ID so router DHCP/IP changes never break Switcher.
+     */
+    public SwitcherDiscovery discoverSwitcherOnLanSync() {
+        String expectedId = getSwitcherDeviceId().toLowerCase(Locale.ROOT);
+        int[] ports = {SWITCHER_UDP_PORT_V2, SWITCHER_UDP_PORT_V4};
+        for (int p : ports) {
+            try (DatagramSocket sock = new DatagramSocket(p)) {
+                sock.setReuseAddress(true);
+                sock.setBroadcast(true);
+                sock.setSoTimeout(1200);
+                byte[] buf = new byte[512];
+                long deadline = System.currentTimeMillis() + 1500L;
+                while (System.currentTimeMillis() < deadline) {
+                    DatagramPacket pkt = new DatagramPacket(buf, buf.length);
+                    try {
+                        sock.receive(pkt);
+                    } catch (IOException timeout) {
+                        break;
+                    }
+                    String ip = pkt.getAddress() != null ? pkt.getAddress().getHostAddress() : "";
+                    SwitcherDiscovery found = parseSwitcherBroadcastPacket(pkt.getData(), pkt.getLength(), ip);
+                    if (found != null && (expectedId.isEmpty() || expectedId.equalsIgnoreCase(found.deviceId))) {
+                        if (appContext != null) {
+                            appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                                    .edit()
+                                    .putString("switcher_device_id", found.deviceId)
+                                    .putString("switcher_lan_ip", found.lanIp)
+                                    .apply();
+                            Device boiler = findDevice("switcher_boiler");
+                            if (boiler != null) boiler.setCurrentIp(found.lanIp);
+                            try {
+                                CloudSyncManager.get(appContext).recordLocalFieldChange(
+                                        CloudSyncManager.Scope.HOUSEHOLD, "switcher_device_id");
+                            } catch (RuntimeException ignored) {
+                            }
+                        }
+                        return found;
+                    }
+                }
+            } catch (IOException ignored) {
+            }
+        }
+        return null;
+    }
+
     private boolean sendSwitcherState(boolean on, int timerMinutes) {
         String key = Secrets.get(appContext, "switcher_api_key");
         String ha = Secrets.get(appContext, "ha_token");
+        if (getSwitcherLanIp().isEmpty()) {
+            discoverSwitcherOnLanSync();
+        }
         return !key.isEmpty() || !ha.isEmpty();
     }
 

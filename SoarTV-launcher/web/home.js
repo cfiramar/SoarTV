@@ -1079,7 +1079,9 @@
       {label: tr('Inputs'), sub: 'Show, hide & reorder TV inputs', icon: 'hdmi', value: '›', inputs: true,
         step: function (d) { if (d >= 0) openEdit('inputs'); }},
       {label: tr('Shelf'), sub: 'Reorder favorite apps in the Home Side-Shelf', icon: 'apps', value: '›', shelf: true,
-        step: function (d) { if (d >= 0) openEdit('shelf'); }}
+        step: function (d) { if (d >= 0) openEdit('shelf'); }},
+      {label: 'Custom Favorite Apps Shelf for This TV', sub: 'Keep a separate Favorite Apps list on this TV instead of syncing with your profile', icon: 'apps', toggle: Prefs.tvOverrideShelf(),
+        step: function () { Prefs.set('tvOverrideShelf', !Prefs.tvOverrideShelf()); pickShelfApps(); }}
     ];
     if (TV.canReturnHome) {
       inputsRows.push({
@@ -1098,6 +1100,8 @@
       {label: tr('Screensaver'), sub: 'Rotating media photos or OLED drifting clock', icon: 'clock',
         value: Prefs.saver() === 'clock' ? tr('Clock') : tr('Photos'),
         step: function (d) { cycle('saver', ['photos', 'clock'], Prefs.saver(), d); }},
+      {label: 'Custom Screensaver for This TV', sub: 'Keep separate screensaver preferences only on this TV', icon: 'display', toggle: Prefs.tvOverrideScreensaver(),
+        step: function () { Prefs.set('tvOverrideScreensaver', !Prefs.tvOverrideScreensaver()); }},
       {label: tr('Watch from the screensaver'), sub: 'Press OK on a screensaver photo to open its app', icon: 'play', toggle: Prefs.saverWatch(),
         step: function () { Prefs.set('saverWatch', !Prefs.saverWatch()); }},
       {label: tr('Weather widget'), sub: 'Show live weather pill and ambient forecast', icon: 'sunny', toggle: Prefs.weather(),
@@ -1128,7 +1132,18 @@
         step: function () { Prefs.set('cloudRemoteEnabled', !Prefs.cloudRemoteEnabled()); reconnectSupabase(); renderTopBar(); }},
       {label: 'Cloud Remote Channel', sub: 'Topic: ' + SupabaseService.channelTopic(), icon: 'wifi',
         value: SupabaseService.channelCode(), tone: SupabaseService.isRemoteConnected() ? 'ok' : '',
-        step: function (d) { if (d >= 0) openInputModal('Cloud Remote Channel ID', SupabaseService.channelCode(), 'living-room-tv', function (val) { Prefs.set('cloudRemoteChannel', val); reconnectSupabase(); renderSettings(); }); }}
+        step: function (d) { if (d >= 0) openInputModal('Cloud Remote Channel ID', SupabaseService.channelCode(), 'living-room-tv', function (val) { Prefs.set('cloudRemoteChannel', val); reconnectSupabase(); renderSettings(); }); }},
+      {label: 'Sync Cloud Settings & Encrypted Vault Now', sub: CloudSyncService.getStatus().status + ' · Automatic Household-Key AES-256-GCM sync', icon: 'sync',
+        value: CloudSyncService.isConfigured() ? 'Sync' : tr('Not set'), tone: CloudSyncService.isConfigured() ? 'ok' : '',
+        step: function () {
+          toast('Syncing Cloud Settings & Encrypted Vault…');
+          var appIds = apps.map(function (a) { return a.id; });
+          CloudSyncService.syncNow('manual', function () {
+            pickShelfApps();
+            renderAll();
+            toast('Cloud Sync: ' + CloudSyncService.getStatus().status);
+          }, appIds);
+        }}
     ];
 
     var gamingRows = [
@@ -2369,9 +2384,18 @@
   function reconnectSupabase() {
     if (!SupabaseService.isConfigured()) {
       SupabaseService.disconnectRemote();
+      CloudSyncService.stopPeriodic();
       return;
     }
-    SupabaseService.fetchProfiles(function () { renderTopBar(); });
+    var appIds = apps.map(function (a) { return a.id; });
+    SupabaseService.fetchProfiles(function () {
+      renderTopBar();
+      CloudSyncService.syncNow('boot', function () {
+        pickShelfApps();
+        renderAll();
+      }, appIds);
+      CloudSyncService.startPeriodic();
+    });
     if (tvAboutInfo) SupabaseService.registerTvDevice(tvAboutInfo);
     if (Prefs.cloudRemoteEnabled()) {
       SupabaseService.connectRemote(handleRemoteCommand, function () {
@@ -2597,6 +2621,17 @@
     loadApps(function () { goScreen('home', false); Data.refresh(); });
   }
 
+  Prefs.onChange(function (prefName) {
+    if (typeof CloudSyncService !== 'undefined') CloudSyncService.handlePrefMutation(prefName);
+  });
+  CloudSyncService.setOnApplied(function () {
+    I18N.set(Prefs.language());
+    direction();
+    I18N.setClock(Prefs.clockFormat());
+    pickShelfApps();
+    renderAll();
+  });
+
   Data.onChange(function () {
     renderTopBar();
     if (st.screen === 'home') renderHome();
@@ -2610,11 +2645,14 @@
   document.addEventListener('visibilitychange', function () {
     hideSaver(); hideAmbient();
     if (document.hidden) {
+      CloudSyncService.stopPeriodic();
       if (TV.name === 'tizen') SupabaseService.disconnectRemote();
       return;
     }
     idleAt = Date.now();
     TV.noteChannel();
+    CloudSyncService.startPeriodic();
+    CloudSyncService.syncNow('resume', null, apps.map(function (a) { return a.id; }));
     if (TV.name === 'tizen') { renderClock(); checkNight(); applyDim(); reconnectSupabase(); }
     loadApps(function () { renderAll(); Data.refresh(); });
   });

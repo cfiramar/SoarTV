@@ -1457,6 +1457,7 @@ class LaptopGamingAgentTests(unittest.TestCase):
                 find_game_hwnd_fn=lambda g: (visible_game_hwnds[0] if visible_game_hwnds else 0),
                 apply_curtain_z_order_fn=lambda mode, hwnd: z_states.append((mode, hwnd)),
                 fallback_launch_fn=lambda g: (fallback_launches.append(g.game_id) is None and True),
+                close_sunshine_app_fn=lambda: True,
                 create_native_window=False,
                 poll_interval_sec=0.02,
                 fallback_spawn_grace_sec=0.05,
@@ -4915,6 +4916,83 @@ class LaptopGamingTerminationTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             parsed = json.loads(buf.getvalue())
             self.assertEqual(parsed["monitors"][0]["friendlyName"], "DeskMonitor24")
+
+    def test_multi_tv_beacon_and_supabase_host_reporter_v2_ip_resilience(self) -> None:
+        from laptop_gaming_agent import SupabaseHostReporter, TvBeaconNotifier
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "tvs.json"
+            beacon = TvBeaconNotifier(endpoint_store_path=store)
+            beacon.record_authenticated_tv("192.168.50.11", "8484", "tv-living-uuid")
+            beacon.record_authenticated_tv("192.168.50.12", "8484", "tv-bedroom-uuid")
+            # Living Room TV changes IP via DHCP (.11 -> .44) -> updates existing TV UUID entry cleanly
+            beacon.record_authenticated_tv("192.168.50.44", "8484", "tv-living-uuid")
+
+            endpoints = beacon.load_all_saved_tv_endpoints()
+            self.assertIn(("192.168.50.44", 8484), endpoints)
+            self.assertIn(("192.168.50.12", 8484), endpoints)
+            self.assertNotIn(("192.168.50.11", 8484), endpoints)
+
+            # Verify notify_ip_changed reaches ALL saved household TVs
+            notified_urls: List[str] = []
+
+            class _FakeResp:
+                status = 200
+
+                def __enter__(self) -> "_FakeResp":
+                    return self
+
+                def __exit__(self, *_a: Any) -> bool:
+                    return False
+
+            def fake_urlopen(req: Any, timeout: float = 1.5) -> _FakeResp:
+                notified_urls.append(req.full_url)
+                return _FakeResp()
+
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                self.assertTrue(beacon.notify_ip_changed("192.168.50.99", agent_port=8485))
+            self.assertEqual(len(notified_urls), 2)
+            self.assertIn("http://192.168.50.44:8484/api/gaming/pc-announce", notified_urls)
+            self.assertIn("http://192.168.50.12:8484/api/gaming/pc-announce", notified_urls)
+
+            # SupabaseHostReporter builds v2 gaming_hosts payload and sends Dual-Path headers
+            reporter = SupabaseHostReporter(
+                supabase_url="https://demo-proj.supabase.co/",
+                supabase_anon_key="anon_key_v2",
+                household_key="household_key_0123456789abcdef",
+            )
+            self.assertTrue(reporter.is_configured())
+            captured_reqs: List[Any] = []
+
+            def fake_sb_urlopen(req: Any, timeout: float = 4.0) -> _FakeResp:
+                captured_reqs.append(req)
+                return _FakeResp()
+
+            with mock.patch("urllib.request.urlopen", side_effect=fake_sb_urlopen):
+                ok = reporter.report_host(
+                    lan_ip="192.168.50.99",
+                    agent_port=8485,
+                    mac_addresses=["AA:BB:CC:DD:EE:FF"],
+                    sunshine_uuid="sun-uuid-777",
+                    hostname="GAMING-PC",
+                )
+            self.assertTrue(ok)
+            self.assertEqual(len(captured_reqs), 1)
+            req = captured_reqs[0]
+            self.assertEqual(req.full_url, "https://demo-proj.supabase.co/rest/v1/gaming_hosts?on_conflict=host_id")
+            self.assertEqual(req.get_header("X-soartv-household-key"), "household_key_0123456789abcdef")
+            body = json.loads(req.data.decode("utf-8"))
+            self.assertEqual(body["host_id"], "sunshine-sun-uuid-777")
+            self.assertEqual(body["lan_ip"], "192.168.50.99")
+            self.assertEqual(body["mac_addresses"], ["AA:BB:CC:DD:EE:FF"])
+
+            # Unconfigured reporter silently no-ops
+            empty_rep = SupabaseHostReporter(
+                supabase_url="", supabase_anon_key="", household_key="", repo_root=Path(tmp)
+            )
+            with mock.patch.dict(os.environ, {"SUPABASE_URL": "", "SUPABASE_ANON_KEY": "", "HOUSEHOLD_KEY": ""}):
+                self.assertFalse(empty_rep.is_configured())
+                self.assertFalse(empty_rep.report_host("192.168.50.99"))
 
 
 if __name__ == "__main__":

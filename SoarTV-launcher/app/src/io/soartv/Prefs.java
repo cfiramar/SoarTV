@@ -208,11 +208,11 @@ final class Prefs {
 
     /** "auto" (the TV's own 12/24-hour setting), "24" or "12". */
     static String clockFormat() {
-        String v = sp().getString("clock", "auto");
+        String v = profileSp().getString("clock", "auto");
         return v.equals("24") || v.equals("12") ? v : "auto";
     }
 
-    static void setClockFormat(String v) { put("clock", v); }
+    static void setClockFormat(String v) { putProfile("clock", v, "clock_format"); }
 
     /** The app's context in this process (null before App.onCreate). */
     static Context context() {
@@ -229,6 +229,139 @@ final class Prefs {
             inMemoryPrefs = new InMemoryPreferences();
         }
         return inMemoryPrefs;
+    }
+
+    /**
+     * Per-user profile {@link SharedPreferences} store matching Tier 2 ({@code user_profile_settings}).
+     * Falls back to {@link #sp()} in headless JVM tests where {@code app == null}, and lazily seeds the
+     * default profile from legacy {@code "settings"} on first upgrade so zero existing user state is lost.
+     */
+    private static SharedPreferences profileSp() {
+        if (app == null) {
+            return sp();
+        }
+        String profSlug = "default";
+        boolean isDefaultProfile = true;
+        try {
+            UserProfileManager.Profile active = UserProfileManager.get(app).getActiveProfile();
+            if (active != null && active.username != null && !active.username.trim().isEmpty()) {
+                profSlug = active.username.trim().toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_-]", "_");
+                isDefaultProfile = active.isDefault;
+            }
+        } catch (RuntimeException ignored) {
+        }
+        SharedPreferences psp = app.getSharedPreferences("profile_" + profSlug, Context.MODE_PRIVATE);
+        if (isDefaultProfile && !psp.getBoolean("_seeded_v2", false)) {
+            seedDefaultProfileFromLegacy(psp, sp());
+        }
+        return psp;
+    }
+
+    private static synchronized void seedDefaultProfileFromLegacy(SharedPreferences target, SharedPreferences legacy) {
+        if (target.getBoolean("_seeded_v2", false)) return;
+        SharedPreferences.Editor ed = target.edit().putBoolean("_seeded_v2", true);
+        Map<String, ?> all = legacy.getAll();
+        if (all != null) {
+            for (Map.Entry<String, ?> e : all.entrySet()) {
+                String k = e.getKey();
+                Object v = e.getValue();
+                if (k == null || v == null) continue;
+                if (isProfileScopedKey(k)) {
+                    putAny(ed, k, v);
+                }
+            }
+        }
+        ed.apply();
+    }
+
+    private static boolean isProfileScopedKey(String k) {
+        return "theme".equals(k) || "autoThemeMode".equals(k) || "autoDarkHour".equals(k) || "autoLightHour".equals(k)
+                || "language".equals(k) || "clock".equals(k) || "temperature".equals(k) || "hideAnimation".equals(k)
+                || "servicesOff".equals(k) || "servicesOn".equals(k)
+                || "genreOrder".equals(k) || "genreOrder_tv".equals(k) || "genreOrder_movie".equals(k)
+                || "hiddenGenres_tv".equals(k) || "hiddenGenres_movie".equals(k)
+                || "watchlistOrder_tv".equals(k) || "watchlistOrder_movie".equals(k)
+                || "watchedItems".equals(k) || k.startsWith("watchedSeasons:") || k.startsWith("autoUnwatchedSeason:")
+                || "watchOff".equals(k) || "watchHidden".equals(k)
+                || k.startsWith("watchHiddenAt:") || k.startsWith("watchHiddenState:")
+                || "shelf".equals(k) || "appOrder".equals(k) || "hiddenApps".equals(k) || "permHiddenApps".equals(k)
+                || k.startsWith("saver");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void putAny(SharedPreferences.Editor ed, String k, Object v) {
+        if (v instanceof String) ed.putString(k, (String) v);
+        else if (v instanceof Boolean) ed.putBoolean(k, (Boolean) v);
+        else if (v instanceof Integer) ed.putInt(k, (Integer) v);
+        else if (v instanceof Long) ed.putLong(k, (Long) v);
+        else if (v instanceof Float) ed.putFloat(k, (Float) v);
+        else if (v instanceof Set) ed.putStringSet(k, new HashSet<>((Set<String>) v));
+    }
+
+    private static void touchCloud(CloudSyncManager.Scope scope, String fieldKey) {
+        if (app == null) return;
+        try {
+            CloudSyncManager.get(app).recordLocalFieldChange(scope, fieldKey);
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    private static void touchCloudSecret(CloudSyncManager.Scope scope, String secretKey) {
+        if (app == null) return;
+        try {
+            CloudSyncManager.get(app).recordLocalSecretChange(scope, secretKey);
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    private static void putProfile(String key, String value, String cloudField) {
+        profileSp().edit().putString(key, value).apply();
+        version++;
+        touchCloud(CloudSyncManager.Scope.PROFILE, cloudField);
+    }
+
+    private static void putProfile(String key, int value, String cloudField) {
+        profileSp().edit().putInt(key, value).apply();
+        version++;
+        touchCloud(CloudSyncManager.Scope.PROFILE, cloudField);
+    }
+
+    private static void putProfile(String key, boolean value, String cloudField) {
+        profileSp().edit().putBoolean(key, value).apply();
+        version++;
+        touchCloud(CloudSyncManager.Scope.PROFILE, cloudField);
+    }
+
+    private static void putProfile(String key, long value, String cloudField) {
+        profileSp().edit().putLong(key, value).apply();
+        version++;
+        touchCloud(CloudSyncManager.Scope.PROFILE, cloudField);
+    }
+
+    private static SharedPreferences screensaverSp() {
+        return isTvOverrideScreensaverEnabled() ? sp() : profileSp();
+    }
+
+    private static CloudSyncManager.Scope screensaverScope() {
+        return isTvOverrideScreensaverEnabled() ? CloudSyncManager.Scope.TV_DEVICE : CloudSyncManager.Scope.PROFILE;
+    }
+
+    private static void putSaver(String key, String value) {
+        screensaverSp().edit().putString(key, value).apply();
+        version++;
+        touchCloud(screensaverScope(), "screensaver");
+    }
+
+    private static void putSaver(String key, boolean value) {
+        screensaverSp().edit().putBoolean(key, value).apply();
+        version++;
+        touchCloud(screensaverScope(), "screensaver");
+    }
+
+    private static void putSaver(String key, long value) {
+        screensaverSp().edit().putLong(key, value).apply();
+        version++;
+        touchCloud(screensaverScope(), "screensaver");
     }
 
     private static final class InMemoryPreferences implements SharedPreferences {
@@ -347,20 +480,20 @@ final class Prefs {
 
     /** "auto" or a language code as picked ("pt", "fr", "zh-CN"…); Ui.applyLanguage finds its catalogue. */
     static String language() {
-        String v = app == null ? Config.LANGUAGE : sp().getString("language", Config.LANGUAGE);
+        String v = app == null ? Config.LANGUAGE : profileSp().getString("language", Config.LANGUAGE);
         v = v.trim();
         return v.isEmpty() || v.equalsIgnoreCase("auto") ? "auto" : v;
     }
 
-    static void setLanguage(String v) { put("language", v); Ui.applyLanguage(); }
+    static void setLanguage(String v) { putProfile("language", v, "language"); Ui.applyLanguage(); }
 
     /** "auto", "C" or "F". */
     static String temperature() {
-        String v = sp().getString("temperature", Config.TEMPERATURE).trim().toUpperCase(Locale.ROOT);
+        String v = profileSp().getString("temperature", Config.TEMPERATURE).trim().toUpperCase(Locale.ROOT);
         return v.startsWith("F") ? "F" : v.startsWith("C") ? "C" : "auto";
     }
 
-    static void setTemperature(String v) { put("temperature", v); }
+    static void setTemperature(String v) { putProfile("temperature", v, "temperature"); }
 
     /** Picks per tab on the home screen: 3 (as it always was) up to Recs.MAX_CARDS. */
     static int cards() {
@@ -371,10 +504,19 @@ final class Prefs {
 
     /** Cartoons and anime out of the picks (Home Settings > Picks): hide_animation in config.properties until changed here. */
     static boolean hideAnimation() {
-        return sp().getBoolean("hideAnimation", Config.HIDE_ANIMATION);
+        return profileSp().getBoolean("hideAnimation", Config.HIDE_ANIMATION);
     }
 
-    static void setHideAnimation(boolean hide) { put("hideAnimation", hide); }
+    static void setHideAnimation(boolean hide) { putProfile("hideAnimation", hide, "hide_animation"); }
+
+    /** Explicit opt-in toggle allowing a secondary profile to reuse the household Stremio connection. */
+    static boolean useHouseholdStremio() {
+        return profileSp().getBoolean("useHouseholdStremio", false);
+    }
+
+    static void setUseHouseholdStremio(boolean enabled) {
+        putProfile("useHouseholdStremio", enabled, "use_household_stremio");
+    }
 
     // MARK: - Picks from
 
@@ -428,35 +570,35 @@ final class Prefs {
 
     /** "auto" (dark from sunset to sunrise or custom hours), "light" or "dark". */
     static String theme() {
-        String v = sp().getString("theme", Config.THEME.trim());
+        String v = profileSp().getString("theme", Config.THEME.trim());
         return v.equals("light") || v.equals("dark") ? v : "auto";
     }
 
-    static void setTheme(String v) { put("theme", v); }
+    static void setTheme(String v) { putProfile("theme", v, "theme"); }
 
     /** When theme() is "auto": "sun" (by sunrise/sunset) or "hours" (custom start hours). */
     static String autoThemeMode() {
-        String v = sp().getString("autoThemeMode", "sun");
+        String v = profileSp().getString("autoThemeMode", "sun");
         return "hours".equals(v) ? "hours" : "sun";
     }
 
-    static void setAutoThemeMode(String v) { put("autoThemeMode", "hours".equals(v) ? "hours" : "sun"); }
+    static void setAutoThemeMode(String v) { putProfile("autoThemeMode", "hours".equals(v) ? "hours" : "sun", "auto_theme_mode"); }
 
     /** Hour of day (0..23) when Dark Mode starts in "hours" auto-theme mode (default 19 = 19:00). */
     static int autoDarkHour() {
-        int h = sp().getInt("autoDarkHour", 19);
+        int h = profileSp().getInt("autoDarkHour", 19);
         return Math.max(0, Math.min(23, h));
     }
 
-    static void setAutoDarkHour(int h) { put("autoDarkHour", Math.max(0, Math.min(23, h))); }
+    static void setAutoDarkHour(int h) { putProfile("autoDarkHour", Math.max(0, Math.min(23, h)), "auto_dark_hour"); }
 
     /** Hour of day (0..23) when Light Mode starts in "hours" auto-theme mode (default 7 = 07:00). */
     static int autoLightHour() {
-        int h = sp().getInt("autoLightHour", 7);
+        int h = profileSp().getInt("autoLightHour", 7);
         return Math.max(0, Math.min(23, h));
     }
 
-    static void setAutoLightHour(int h) { put("autoLightHour", Math.max(0, Math.min(23, h))); }
+    static void setAutoLightHour(int h) { putProfile("autoLightHour", Math.max(0, Math.min(23, h)), "auto_light_hour"); }
 
     /** Tuner mode for Channels & Inputs -> Channels -> Tuner Mode ("antenna", "cable", "satellite"). */
     static String tunerMode() {
@@ -464,15 +606,15 @@ final class Prefs {
         return ("cable".equals(v) || "satellite".equals(v)) ? v : "antenna";
     }
 
-    static void setTunerMode(String v) { put("tunerMode", v); }
+    static void setTunerMode(String v) { put("tunerMode", v); touchCloud(CloudSyncManager.Scope.TV_DEVICE, "ui_prefs"); }
 
     /** Update channels automatically toggle under Channels & Inputs -> Channels. */
     static boolean autoUpdateChannels() { return sp().getBoolean("autoUpdateChannels", true); }
-    static void setAutoUpdateChannels(boolean on) { put("autoUpdateChannels", on); }
+    static void setAutoUpdateChannels(boolean on) { put("autoUpdateChannels", on); touchCloud(CloudSyncManager.Scope.TV_DEVICE, "ui_prefs"); }
 
     /** Wi-Fi/Ethernet, Bluetooth and USB icons at the top-left of the home screen. */
     static boolean statusIcons() { return sp().getBoolean("statusicons", false); }
-    static void setStatusIcons(boolean on) { put("statusicons", on); }
+    static void setStatusIcons(boolean on) { put("statusicons", on); touchCloud(CloudSyncManager.Scope.TV_DEVICE, "ui_prefs"); }
 
     // MARK: - City
 
@@ -483,15 +625,54 @@ final class Prefs {
     static void setCity(String name, String latitude, String longitude) {
         sp().edit().putString("city", name).putString("latitude", latitude).putString("longitude", longitude).apply();
         version++;
+        touchCloud(CloudSyncManager.Scope.HOUSEHOLD, "default_location");
     }
 
     /** The home screen's soft click when moving and opening. */
     static boolean sounds() { return sp().getBoolean("sounds", true); }
-    static void setSounds(boolean on) { put("sounds", on); }
+    static void setSounds(boolean on) { put("sounds", on); touchCloud(CloudSyncManager.Scope.TV_DEVICE, "ui_prefs"); }
+
+    // MARK: - Per-TV Override Switches (Favorite Apps Shelf, Hidden Apps, Screensaver)
+
+    /** When true, this TV uses its own custom Favorite Apps Shelf instead of the active User Profile's synced shelf. */
+    static boolean isTvOverrideShelfEnabled() { return sp().getBoolean("tvOverrideShelf", false); }
+    static void setTvOverrideShelfEnabled(boolean enabled) {
+        if (enabled && tvOverrideShelf() == null) {
+            List<String> cur = profileShelf();
+            if (cur != null) setTvOverrideShelf(cur);
+        }
+        put("tvOverrideShelf", enabled);
+        touchCloud(CloudSyncManager.Scope.TV_DEVICE, "override_shelf");
+    }
+
+    /** When true, this TV uses its own custom Hidden Apps lists instead of the active User Profile's synced lists. */
+    static boolean isTvOverrideHiddenAppsEnabled() { return sp().getBoolean("tvOverrideHiddenApps", false); }
+    static void setTvOverrideHiddenAppsEnabled(boolean enabled) {
+        if (enabled && !sp().contains("tvOverrideHiddenAppsSeeded")) {
+            sp().edit()
+                    .putStringSet("tv_hiddenApps", new HashSet<>(profileHiddenApps()))
+                    .putStringSet("tv_permHiddenApps", new HashSet<>(profilePermHiddenApps()))
+                    .putBoolean("tvOverrideHiddenAppsSeeded", true)
+                    .apply();
+        }
+        put("tvOverrideHiddenApps", enabled);
+        touchCloud(CloudSyncManager.Scope.TV_DEVICE, "override_hidden_apps");
+    }
+
+    /** When true, this TV uses its own custom Screensaver settings instead of the active User Profile's synced settings. */
+    static boolean isTvOverrideScreensaverEnabled() { return sp().getBoolean("tvOverrideScreensaver", false); }
+    static void setTvOverrideScreensaverEnabled(boolean enabled) {
+        if (enabled && !sp().contains("tvOverrideScreensaverSeeded")) {
+            importScreensaverMapInto(sp(), exportProfileScreensaverMap());
+            sp().edit().putBoolean("tvOverrideScreensaverSeeded", true).apply();
+        }
+        put("tvOverrideScreensaver", enabled);
+        touchCloud(CloudSyncManager.Scope.TV_DEVICE, "override_screensaver");
+    }
 
     /** OK on the screensaver opens the title it shows, in its app; any other key only closes it. Off: any key closes it. */
-    static boolean saverWatch() { return sp().getBoolean("saverWatch", false); }
-    static void setSaverWatch(boolean on) { put("saverWatch", on); }
+    static boolean saverWatch() { return screensaverSp().getBoolean("saverWatch", false); }
+    static void setSaverWatch(boolean on) { putSaver("saverWatch", on); }
 
     /** Rotating Photography Screensaver 6 core categories. */
     static final String[] SAVER_CATEGORIES = {"nature", "urban", "macro", "space", "paintings", "art"};
@@ -503,9 +684,10 @@ final class Prefs {
 
     /** Returns the active set of screensaver gallery categories (minimum 1 guaranteed). */
     static Set<String> saverCategories() {
-        String raw = sp().getString("saverCategories", null);
+        SharedPreferences ssp = screensaverSp();
+        String raw = ssp.getString("saverCategories", null);
         if (raw == null || raw.trim().isEmpty()) {
-            String legacy = sp().getString("saverCategory", null);
+            String legacy = ssp.getString("saverCategory", null);
             if (legacy != null && !legacy.trim().isEmpty() && !"mixed".equalsIgnoreCase(legacy)) {
                 String lower = legacy.trim().toLowerCase(Locale.ROOT);
                 if (CORE_SAVER_CATEGORIES.contains(lower)) {
@@ -553,8 +735,8 @@ final class Prefs {
             if (sb.length() > 0) sb.append(',');
             sb.append(cat);
         }
-        put("saverCategories", sb.toString());
-        put("saverCategory", valid.iterator().next());
+        putSaver("saverCategories", sb.toString());
+        putSaver("saverCategory", valid.iterator().next());
     }
 
     /**
@@ -608,56 +790,220 @@ final class Prefs {
             "modern_serif", "digital_mono", "minimal", "outline"
     };
     static String saverClockStyle() {
-        String v = sp().getString("saverClockStyle", "liquid_glass");
+        String v = screensaverSp().getString("saverClockStyle", "liquid_glass");
         if ("editorial".equals(v)) return "stacked";
         if ("classic".equals(v)) return "frosted_pill";
         for (String s : SAVER_CLOCK_STYLES) if (s.equals(v)) return s;
         return "liquid_glass";
     }
-    static void setSaverClockStyle(String v) { put("saverClockStyle", v); }
+    static void setSaverClockStyle(String v) { putSaver("saverClockStyle", v); }
 
     /** Screensaver World Clock secondary timezone and city label. */
-    static String saverWorldClockTz() { return sp().getString("saverWorldClockTz", "America/New_York"); }
-    static String saverWorldClockLabel() { return sp().getString("saverWorldClockLabel", "NYC"); }
+    static String saverWorldClockTz() { return screensaverSp().getString("saverWorldClockTz", "America/New_York"); }
+    static String saverWorldClockLabel() { return screensaverSp().getString("saverWorldClockLabel", "NYC"); }
     static void setSaverWorldClock(String tz, String label) {
-        sp().edit().putString("saverWorldClockTz", tz).putString("saverWorldClockLabel", label).apply();
+        screensaverSp().edit().putString("saverWorldClockTz", tz).putString("saverWorldClockLabel", label).apply();
+        version++;
+        touchCloud(screensaverScope(), "screensaver");
+    }
+
+    /** Screensaver overlay toggles (artist, location, local time, world clock, weather, calendar, shortcuts). */
+    static boolean saverShowArtist() { return screensaverSp().getBoolean("saverShowArtist", true); }
+    static void setSaverShowArtist(boolean on) { putSaver("saverShowArtist", on); }
+    static boolean saverShowLocation() { return screensaverSp().getBoolean("saverShowLocation", true); }
+    static void setSaverShowLocation(boolean on) { putSaver("saverShowLocation", on); }
+    static boolean saverShowArtworkTitle() { return screensaverSp().getBoolean("saverShowArtworkTitle", true); }
+    static void setSaverShowArtworkTitle(boolean on) { putSaver("saverShowArtworkTitle", on); }
+    static boolean saverShowLocalTime() { return screensaverSp().getBoolean("saverShowLocalTime", true); }
+    static void setSaverShowLocalTime(boolean on) { putSaver("saverShowLocalTime", on); }
+    static boolean saverShowWorldClock() { return screensaverSp().getBoolean("saverShowWorldClock", true); }
+    static void setSaverShowWorldClock(boolean on) { putSaver("saverShowWorldClock", on); }
+    static boolean saverShowWeather() { return screensaverSp().getBoolean("saverShowWeather", true); }
+    static void setSaverShowWeather(boolean on) { putSaver("saverShowWeather", on); }
+    static boolean saverShowCalendar() { return screensaverSp().getBoolean("saverShowCalendar", true); }
+    static void setSaverShowCalendar(boolean on) { putSaver("saverShowCalendar", on); }
+    static boolean saverShowShortcuts() { return screensaverSp().getBoolean("saverShowShortcuts", true); }
+    static void setSaverShowShortcuts(boolean on) { putSaver("saverShowShortcuts", on); }
+
+    /** Ken Burns image animation toggle: zooming and panning. Default is true (enabled). */
+    static boolean saverAnimation() { return screensaverSp().getBoolean("saverAnimation", true); }
+    static void setSaverAnimation(boolean on) { putSaver("saverAnimation", on); }
+
+    /**
+     * Curated cyclic slide duration intervals in milliseconds for the 4K Screensaver:
+     * 0 ("Don't change image") through 2h, wrapping cyclically back to 0.
+     */
+    static final long[] SAVER_INTERVALS_MS = {
+            0L,
+            10_000L, 15_000L, 20_000L, 30_000L, 45_000L, 60_000L,
+            90_000L, 120_000L, 300_000L, 600_000L, 900_000L, 1_800_000L, 2_700_000L,
+            3_600_000L, 5_400_000L, 7_200_000L
+    };
+    static final String[] SAVER_INTERVAL_LABELS = {
+            "Don't change image",
+            "10s", "15s", "20s", "30s", "45s", "60s",
+            "1:30 min", "2 min", "5 min", "10 min", "15 min", "30 min", "45 min",
+            "1h", "1:30h", "2h"
+    };
+
+    static long saverIntervalMs() {
+        long v = screensaverSp().getLong("saverIntervalMs", 30_000L);
+        return Math.max(0L, v);
+    }
+
+    static void setSaverIntervalMs(long ms) { putSaver("saverIntervalMs", Math.max(0L, ms)); }
+
+    static Map<String, Object> exportProfileScreensaverMap() { return exportScreensaverMapFrom(profileSp()); }
+    static void importProfileScreensaverMap(Map<String, Object> map) { importScreensaverMapInto(profileSp(), map); }
+    static Map<String, Object> exportTvOverrideScreensaverMap() { return exportScreensaverMapFrom(sp()); }
+    static void importTvOverrideScreensaverMap(Map<String, Object> map) { importScreensaverMapInto(sp(), map); }
+
+    private static Map<String, Object> exportScreensaverMapFrom(SharedPreferences target) {
+        Map<String, Object> m = new java.util.LinkedHashMap<>();
+        String rawCats = target.getString("saverCategories", DEFAULT_SAVER_CATEGORIES);
+        List<String> cats = new ArrayList<>();
+        if (rawCats != null) {
+            for (String tok : rawCats.split(",")) {
+                String c = tok.trim().toLowerCase(Locale.ROOT);
+                if (!c.isEmpty() && CORE_SAVER_CATEGORIES.contains(c) && !cats.contains(c)) cats.add(c);
+            }
+        }
+        if (cats.isEmpty()) cats.addAll(CORE_SAVER_CATEGORIES);
+        m.put("categories", cats);
+        m.put("clock_style", target.getString("saverClockStyle", "liquid_glass"));
+        m.put("world_clock_tz", target.getString("saverWorldClockTz", "America/New_York"));
+        m.put("world_clock_label", target.getString("saverWorldClockLabel", "NYC"));
+        m.put("interval_ms", Math.max(0L, target.getLong("saverIntervalMs", 30_000L)));
+        m.put("animation", target.getBoolean("saverAnimation", true));
+        m.put("watch", target.getBoolean("saverWatch", false));
+        m.put("show_artist", target.getBoolean("saverShowArtist", true));
+        m.put("show_location", target.getBoolean("saverShowLocation", true));
+        m.put("show_artwork_title", target.getBoolean("saverShowArtworkTitle", true));
+        m.put("show_local_time", target.getBoolean("saverShowLocalTime", true));
+        m.put("show_world_clock", target.getBoolean("saverShowWorldClock", true));
+        m.put("show_weather", target.getBoolean("saverShowWeather", true));
+        m.put("show_calendar", target.getBoolean("saverShowCalendar", true));
+        m.put("show_shortcuts", target.getBoolean("saverShowShortcuts", true));
+        return m;
+    }
+
+    private static void importScreensaverMapInto(SharedPreferences target, Map<String, Object> m) {
+        if (target == null || m == null || m.isEmpty()) return;
+        SharedPreferences.Editor ed = target.edit();
+        List<String> cats = CloudVaultCrypto.JsonCodec.optStringList(m, "categories");
+        if (!cats.isEmpty()) {
+            StringBuilder sb = new StringBuilder();
+            String first = null;
+            for (String c : cats) {
+                String clean = c.trim().toLowerCase(Locale.ROOT);
+                if (CORE_SAVER_CATEGORIES.contains(clean)) {
+                    if (sb.length() > 0) sb.append(',');
+                    sb.append(clean);
+                    if (first == null) first = clean;
+                }
+            }
+            if (first != null) {
+                ed.putString("saverCategories", sb.toString());
+                ed.putString("saverCategory", first);
+            }
+        }
+        if (m.containsKey("clock_style")) ed.putString("saverClockStyle", CloudVaultCrypto.JsonCodec.optString(m, "clock_style", "liquid_glass"));
+        if (m.containsKey("world_clock_tz")) ed.putString("saverWorldClockTz", CloudVaultCrypto.JsonCodec.optString(m, "world_clock_tz", "America/New_York"));
+        if (m.containsKey("world_clock_label")) ed.putString("saverWorldClockLabel", CloudVaultCrypto.JsonCodec.optString(m, "world_clock_label", "NYC"));
+        if (m.containsKey("interval_ms")) ed.putLong("saverIntervalMs", Math.max(0L, CloudVaultCrypto.JsonCodec.optLong(m, "interval_ms", 30_000L)));
+        if (m.containsKey("animation")) ed.putBoolean("saverAnimation", CloudVaultCrypto.JsonCodec.optBoolean(m, "animation", true));
+        if (m.containsKey("watch")) ed.putBoolean("saverWatch", CloudVaultCrypto.JsonCodec.optBoolean(m, "watch", false));
+        if (m.containsKey("show_artist")) ed.putBoolean("saverShowArtist", CloudVaultCrypto.JsonCodec.optBoolean(m, "show_artist", true));
+        if (m.containsKey("show_location")) ed.putBoolean("saverShowLocation", CloudVaultCrypto.JsonCodec.optBoolean(m, "show_location", true));
+        if (m.containsKey("show_artwork_title")) ed.putBoolean("saverShowArtworkTitle", CloudVaultCrypto.JsonCodec.optBoolean(m, "show_artwork_title", true));
+        if (m.containsKey("show_local_time")) ed.putBoolean("saverShowLocalTime", CloudVaultCrypto.JsonCodec.optBoolean(m, "show_local_time", true));
+        if (m.containsKey("show_world_clock")) ed.putBoolean("saverShowWorldClock", CloudVaultCrypto.JsonCodec.optBoolean(m, "show_world_clock", true));
+        if (m.containsKey("show_weather")) ed.putBoolean("saverShowWeather", CloudVaultCrypto.JsonCodec.optBoolean(m, "show_weather", true));
+        if (m.containsKey("show_calendar")) ed.putBoolean("saverShowCalendar", CloudVaultCrypto.JsonCodec.optBoolean(m, "show_calendar", true));
+        if (m.containsKey("show_shortcuts")) ed.putBoolean("saverShowShortcuts", CloudVaultCrypto.JsonCodec.optBoolean(m, "show_shortcuts", true));
+        ed.apply();
         version++;
     }
 
-    /** Screensaver overlay toggles (README.txt: artist, location, local time, world clock, weather, calendar, shortcuts). */
-    static boolean saverShowArtist() { return sp().getBoolean("saverShowArtist", true); }
-    static void setSaverShowArtist(boolean on) { put("saverShowArtist", on); }
-    static boolean saverShowLocation() { return sp().getBoolean("saverShowLocation", true); }
-    static void setSaverShowLocation(boolean on) { put("saverShowLocation", on); }
-    static boolean saverShowArtworkTitle() { return sp().getBoolean("saverShowArtworkTitle", true); }
-    static void setSaverShowArtworkTitle(boolean on) { put("saverShowArtworkTitle", on); }
-    static boolean saverShowLocalTime() { return sp().getBoolean("saverShowLocalTime", true); }
-    static void setSaverShowLocalTime(boolean on) { put("saverShowLocalTime", on); }
-    static boolean saverShowWorldClock() { return sp().getBoolean("saverShowWorldClock", true); }
-    static void setSaverShowWorldClock(boolean on) { put("saverShowWorldClock", on); }
-    static boolean saverShowWeather() { return sp().getBoolean("saverShowWeather", true); }
-    static void setSaverShowWeather(boolean on) { put("saverShowWeather", on); }
-    static boolean saverShowCalendar() { return sp().getBoolean("saverShowCalendar", true); }
-    static void setSaverShowCalendar(boolean on) { put("saverShowCalendar", on); }
-    static boolean saverShowShortcuts() { return sp().getBoolean("saverShowShortcuts", true); }
-    static void setSaverShowShortcuts(boolean on) { put("saverShowShortcuts", on); }
-
-    /** Ken Burns image animation toggle: zooming and panning. Default is true (enabled). */
-    static boolean saverAnimation() { return sp().getBoolean("saverAnimation", true); }
-    static void setSaverAnimation(boolean on) { put("saverAnimation", on); }
-
-    /** Slide duration interval in milliseconds. Options: 10s, 15s, 20s, 30s (default), 1m, 2m, 5m. */
-    static final long[] SAVER_INTERVALS_MS = {10_000L, 15_000L, 20_000L, 30_000L, 60_000L, 120_000L, 300_000L};
-    static final String[] SAVER_INTERVAL_LABELS = {"10s", "15s", "20s", "30s", "1m", "2m", "5m"};
-
-    static long saverIntervalMs() { return sp().getLong("saverIntervalMs", 30_000L); }
-    static void setSaverIntervalMs(long ms) { put("saverIntervalMs", ms); }
-    static String saverIntervalLabel() {
-        long cur = saverIntervalMs();
+    /**
+     * Returns the index in {@link #SAVER_INTERVALS_MS} matching {@code ms}, or the nearest preset index
+     * so legacy or custom values snap cleanly onto the cyclic Up/Down duration ladder.
+     */
+    static int saverIntervalIndex(long ms) {
+        if (ms <= 0L) return 0;
+        int bestIdx = 0;
+        long bestDiff = Long.MAX_VALUE;
         for (int i = 0; i < SAVER_INTERVALS_MS.length; i++) {
-            if (SAVER_INTERVALS_MS[i] == cur) return SAVER_INTERVAL_LABELS[i];
+            long diff = Math.abs(SAVER_INTERVALS_MS[i] - ms);
+            if (diff == 0L) return i;
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                bestIdx = i;
+            }
         }
-        return "30s";
+        return bestIdx;
+    }
+
+    /**
+     * Advances {@code currentMs} up to the next slide duration in {@link #SAVER_INTERVALS_MS},
+     * wrapping cleanly from {@code 2h} ({@code 7_200_000L}) back to {@code 0L} ({@code "Don't change image"}).
+     */
+    static long nextSaverIntervalUp(long currentMs) {
+        long cur = Math.max(0L, currentMs);
+        for (int i = 0; i < SAVER_INTERVALS_MS.length; i++) {
+            if (SAVER_INTERVALS_MS[i] == cur) {
+                return SAVER_INTERVALS_MS[(i + 1) % SAVER_INTERVALS_MS.length];
+            }
+            if (SAVER_INTERVALS_MS[i] > cur) {
+                return SAVER_INTERVALS_MS[i];
+            }
+        }
+        return SAVER_INTERVALS_MS[0];
+    }
+
+    /**
+     * Steps {@code currentMs} down to the previous slide duration in {@link #SAVER_INTERVALS_MS},
+     * wrapping cleanly from {@code 0L} ({@code "Don't change image"}) back to {@code 2h} ({@code 7_200_000L}).
+     */
+    static long nextSaverIntervalDown(long currentMs) {
+        long cur = Math.max(0L, currentMs);
+        if (cur <= 0L) {
+            return SAVER_INTERVALS_MS[SAVER_INTERVALS_MS.length - 1];
+        }
+        for (int i = SAVER_INTERVALS_MS.length - 1; i >= 0; i--) {
+            if (SAVER_INTERVALS_MS[i] == cur) {
+                int prev = (i - 1 + SAVER_INTERVALS_MS.length) % SAVER_INTERVALS_MS.length;
+                return SAVER_INTERVALS_MS[prev];
+            }
+            if (SAVER_INTERVALS_MS[i] < cur) {
+                return SAVER_INTERVALS_MS[i];
+            }
+        }
+        return SAVER_INTERVALS_MS[SAVER_INTERVALS_MS.length - 1];
+    }
+
+    /**
+     * Formats any screensaver slide interval in milliseconds into a clean human-readable label.
+     */
+    static String formatSaverIntervalLabel(long ms) {
+        if (ms <= 0L) return SAVER_INTERVAL_LABELS[0];
+        for (int i = 0; i < SAVER_INTERVALS_MS.length; i++) {
+            if (SAVER_INTERVALS_MS[i] == ms) return SAVER_INTERVAL_LABELS[i];
+        }
+        long totalSec = Math.max(1L, ms / 1000L);
+        if (totalSec <= 60L) return totalSec + "s";
+        long mins = totalSec / 60L;
+        long remSec = totalSec % 60L;
+        if (mins < 60L) {
+            return remSec == 0L ? (mins + " min") : String.format(Locale.US, "%d:%02d min", mins, remSec);
+        }
+        long hours = mins / 60L;
+        long remMin = mins % 60L;
+        return remMin == 0L ? (hours + "h") : String.format(Locale.US, "%d:%02dh", hours, remMin);
+    }
+
+    static String saverIntervalLabel() {
+        return formatSaverIntervalLabel(saverIntervalMs());
     }
 
     /** Curated 61 global metropolitan hubs covering every populated UTC offset from UTC-10 to UTC+13. */
@@ -742,7 +1088,7 @@ final class Prefs {
 
     static List<String> genreOrder(String mediaType) {
         String key = "movie".equals(mediaType) ? "genreOrder_movie" : "genreOrder_tv";
-        String v = app != null ? sp().getString(key, sp().getString("genreOrder", null)) : null;
+        String v = app != null ? profileSp().getString(key, profileSp().getString("genreOrder", null)) : null;
         List<String> out = new ArrayList<>();
         if (v != null && !v.isEmpty()) {
             for (String g : v.split(",")) {
@@ -785,7 +1131,7 @@ final class Prefs {
         java.util.Set<String> out = new java.util.HashSet<>();
         if (app == null) return out;
         String key = "movie".equals(mediaType) ? "hiddenGenres_movie" : "hiddenGenres_tv";
-        String raw = sp().getString(key, "");
+        String raw = profileSp().getString(key, "");
         if (raw != null && !raw.isEmpty()) {
             for (String part : raw.split(",")) {
                 String g = part.trim();
@@ -806,12 +1152,22 @@ final class Prefs {
         java.util.Set<String> set = new java.util.LinkedHashSet<>(hiddenGenres(mediaType));
         if (hidden) set.add(genre.trim());
         else set.remove(genre.trim());
+        replaceHiddenGenres(mediaType, set);
+    }
+
+    static void replaceHiddenGenres(String mediaType, Set<String> hiddenSet) {
+        if (app == null) return;
+        String key = "movie".equals(mediaType) ? "hiddenGenres_movie" : "hiddenGenres_tv";
+        String cloudKey = "movie".equals(mediaType) ? "hidden_genres_movie" : "hidden_genres_tv";
         StringBuilder sb = new StringBuilder();
-        for (String g : set) {
-            if (sb.length() > 0) sb.append(',');
-            sb.append(g);
+        if (hiddenSet != null) {
+            for (String g : hiddenSet) {
+                if (g == null || g.trim().isEmpty()) continue;
+                if (sb.length() > 0) sb.append(',');
+                sb.append(g.trim());
+            }
         }
-        put(key, sb.toString());
+        putProfile(key, sb.toString(), cloudKey);
     }
 
     static void setGenreOrder(List<String> genres) {
@@ -820,13 +1176,14 @@ final class Prefs {
 
     static void setGenreOrder(String mediaType, List<String> genres) {
         String key = "movie".equals(mediaType) ? "genreOrder_movie" : "genreOrder_tv";
+        String cloudKey = "movie".equals(mediaType) ? "genre_order_movie" : "genre_order_tv";
         StringBuilder sb = new StringBuilder();
         for (String g : genres) {
             if (g == null || g.trim().isEmpty()) continue;
             if (sb.length() > 0) sb.append(",");
             sb.append(g.trim());
         }
-        put(key, sb.toString());
+        putProfile(key, sb.toString(), cloudKey);
     }
 
     /** Custom order for Smart Home / Drawer items. */
@@ -842,6 +1199,7 @@ final class Prefs {
         StringBuilder sb = new StringBuilder();
         for (String p : ids) sb.append(sb.length() == 0 ? "" : ",").append(p);
         put("drawerOrder", sb.toString());
+        touchCloud(CloudSyncManager.Scope.HOUSEHOLD, "smart_home_order");
     }
 
     /** Preferred Music app for the Headbar Music tab: "ytmusic", "spotify", or "applemusic". */
@@ -865,23 +1223,29 @@ final class Prefs {
     static void setTopContent(String v) { put("topContent", v); }
 
     /** Apps left out of Continue Watching (Settings), by package. */
-    static Set<String> watchOff() { return new HashSet<>(sp().getStringSet("watchOff", new HashSet<>())); }
-    static void setWatchOff(Set<String> packages) { putQuietly("watchOff", packages); }
+    static Set<String> watchOff() { return new HashSet<>(profileSp().getStringSet("watchOff", new HashSet<>())); }
+    static void setWatchOff(Set<String> packages) {
+        profileSp().edit().putStringSet("watchOff", new HashSet<>(packages)).apply();
+        touchCloud(CloudSyncManager.Scope.PROFILE, "watch_off");
+    }
 
     /** Single items hidden from Continue Watching (holding OK on a card), as WatchNext.hideKey. */
-    static Set<String> watchHidden() { return new HashSet<>(sp().getStringSet("watchHidden", new HashSet<>())); }
-    static void setWatchHidden(Set<String> keys) { putQuietly("watchHidden", keys); }
+    static Set<String> watchHidden() { return new HashSet<>(profileSp().getStringSet("watchHidden", new HashSet<>())); }
+    static void setWatchHidden(Set<String> keys) {
+        profileSp().edit().putStringSet("watchHidden", new HashSet<>(keys)).apply();
+        touchCloud(CloudSyncManager.Scope.PROFILE, "watch_hidden");
+    }
 
     /** Timestamp (System.currentTimeMillis) when a Continue Watching item was hidden; watching it after this unhides it. */
     static long watchHiddenAt(String hideKey) {
         if (hideKey == null) return 0L;
-        return sp().getLong("watchHiddenAt:" + hideKey, 0L);
+        return profileSp().getLong("watchHiddenAt:" + hideKey, 0L);
     }
 
     /** Saved playback state signature (episode + minute position) when the item was hidden. */
     static String watchHiddenState(String hideKey) {
         if (hideKey == null) return "";
-        return sp().getString("watchHiddenState:" + hideKey, "");
+        return profileSp().getString("watchHiddenState:" + hideKey, "");
     }
 
     static void hideWatchItem(String hideKey, long hiddenAtMs) {
@@ -892,23 +1256,56 @@ final class Prefs {
         if (hideKey == null) return;
         Set<String> hidden = watchHidden();
         hidden.add(hideKey);
-        sp().edit()
+        profileSp().edit()
                 .putStringSet("watchHidden", hidden)
                 .putLong("watchHiddenAt:" + hideKey, hiddenAtMs)
                 .putString("watchHiddenState:" + hideKey, stateSig == null ? "" : stateSig)
                 .apply();
+        touchCloud(CloudSyncManager.Scope.PROFILE, "watch_hidden");
     }
 
     static void unhideWatchItem(String hideKey) {
         if (hideKey == null) return;
         Set<String> hidden = watchHidden();
         if (hidden.remove(hideKey)) {
-            sp().edit()
+            profileSp().edit()
                     .putStringSet("watchHidden", hidden)
                     .remove("watchHiddenAt:" + hideKey)
                     .remove("watchHiddenState:" + hideKey)
                     .apply();
+            touchCloud(CloudSyncManager.Scope.PROFILE, "watch_hidden");
         }
+    }
+
+    /** Exports per-profile hidden Continue Watching entries (with hiddenAt timestamps & state signatures). */
+    static Map<String, Object> exportWatchHiddenMap() {
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        for (String key : watchHidden()) {
+            Map<String, Object> entry = new java.util.LinkedHashMap<>();
+            entry.put("hidden_at", watchHiddenAt(key));
+            entry.put("state_sig", watchHiddenState(key));
+            out.put(key, entry);
+        }
+        return out;
+    }
+
+    /** Replaces per-profile hidden Continue Watching entries from cloud sync. */
+    static void importWatchHiddenMap(Map<String, Object> map) {
+        Set<String> next = new HashSet<>();
+        SharedPreferences.Editor ed = profileSp().edit();
+        if (map != null) {
+            for (Map.Entry<String, Object> e : map.entrySet()) {
+                if (e.getKey() == null || e.getKey().trim().isEmpty()) continue;
+                String k = e.getKey().trim();
+                next.add(k);
+                Map<String, Object> sub = CloudVaultCrypto.JsonCodec.optObjectMap(map, k);
+                long at = CloudVaultCrypto.JsonCodec.optLong(sub, "hidden_at", 0L);
+                String sig = CloudVaultCrypto.JsonCodec.optString(sub, "state_sig", "");
+                ed.putLong("watchHiddenAt:" + k, at);
+                ed.putString("watchHiddenState:" + k, sig);
+            }
+        }
+        ed.putStringSet("watchHidden", next).apply();
     }
 
     /** Recent Apps: "off" (the default: Android manages memory on its own), "drawer" (a shortcut in the bottom drawer and the
@@ -965,30 +1362,60 @@ final class Prefs {
         sp().edit().putString("tmdbKey", key).commit();
         if (app != null && key != null && !key.trim().isEmpty()) {
             Secrets.putSecret(app, Secrets.TMDB_KEY, key.trim());
+            touchCloudSecret(CloudSyncManager.Scope.HOUSEHOLD, Secrets.TMDB_KEY);
         }
         version++;
     }
 
-    // MARK: - Shelf
+    // MARK: - Shelf & Hidden Apps (Per-Profile by Default, With Optional Per-TV Override)
 
-    /** Packages on the home shelf, in order; null until the user edits it (then the built-in list applies). */
-    static List<String> shelf() {
-        String v = sp().getString("shelf", null);
+    private static List<String> readCsvList(SharedPreferences target, String key) {
+        String v = target.getString(key, null);
         if (v == null) return null;
         List<String> out = new ArrayList<>();
         for (String p : v.split(",")) if (!p.isEmpty()) out.add(p);
         return out;
     }
 
-    static void setShelf(List<String> packages) {
+    private static String joinCsvList(List<String> packages) {
         StringBuilder sb = new StringBuilder();
-        for (String p : packages) sb.append(sb.length() == 0 ? "" : ",").append(p);
-        put("shelf", sb.toString());
+        if (packages != null) {
+            for (String p : packages) if (p != null && !p.isEmpty()) sb.append(sb.length() == 0 ? "" : ",").append(p);
+        }
+        return sb.toString();
+    }
+
+    /** Profile-level favorite shelf packages (used unless this TV overrides the shelf). */
+    static List<String> profileShelf() { return readCsvList(profileSp(), "shelf"); }
+    static void setProfileShelf(List<String> packages) {
+        profileSp().edit().putString("shelf", joinCsvList(packages)).apply();
+        version++;
+        touchCloud(CloudSyncManager.Scope.PROFILE, "shelf_apps");
+    }
+
+    /** TV-override favorite shelf packages (active when {@link #isTvOverrideShelfEnabled()} is true). */
+    static List<String> tvOverrideShelf() { return readCsvList(sp(), "tv_shelf"); }
+    static void setTvOverrideShelf(List<String> packages) {
+        sp().edit().putString("tv_shelf", joinCsvList(packages)).apply();
+        version++;
+        touchCloud(CloudSyncManager.Scope.TV_DEVICE, "shelf_apps");
+    }
+
+    /** Packages on the home shelf, in order; null until the user edits it (then the built-in list applies). */
+    static List<String> shelf() {
+        return isTvOverrideShelfEnabled() ? tvOverrideShelf() : profileShelf();
+    }
+
+    static void setShelf(List<String> packages) {
+        if (isTvOverrideShelfEnabled()) setTvOverrideShelf(packages);
+        else setProfileShelf(packages);
     }
 
     /** Custom order for apps on the Apps screen; null until reordered by the user. */
     static List<String> appOrder() {
-        String v = sp().getString("appOrder", null);
+        SharedPreferences target = isTvOverrideShelfEnabled() ? sp() : profileSp();
+        String key = isTvOverrideShelfEnabled() ? "tv_appOrder" : "appOrder";
+        String v = target.getString(key, null);
         if (v == null || v.isEmpty()) return null;
         List<String> out = new ArrayList<>();
         for (String p : v.split(",")) if (!p.isEmpty()) out.add(p);
@@ -996,41 +1423,92 @@ final class Prefs {
     }
 
     static void setAppOrder(List<String> packages) {
-        StringBuilder sb = new StringBuilder();
-        for (String p : packages) if (p != null && !p.isEmpty()) sb.append(sb.length() == 0 ? "" : ",").append(p);
-        sp().edit().putString("appOrder", sb.toString()).apply();
+        SharedPreferences target = isTvOverrideShelfEnabled() ? sp() : profileSp();
+        String key = isTvOverrideShelfEnabled() ? "tv_appOrder" : "appOrder";
+        target.edit().putString(key, joinCsvList(packages)).apply();
+        touchCloud(isTvOverrideShelfEnabled() ? CloudSyncManager.Scope.TV_DEVICE : CloudSyncManager.Scope.PROFILE, "app_order");
+    }
+
+    static Set<String> profileHiddenApps() {
+        Set<String> hidden = new HashSet<>(profileSp().getStringSet("hiddenApps", new HashSet<>()));
+        hidden.removeAll(profilePermHiddenApps());
+        return hidden;
+    }
+
+    static Set<String> profilePermHiddenApps() {
+        return new HashSet<>(profileSp().getStringSet("permHiddenApps", new HashSet<>()));
+    }
+
+    static void replaceProfileHiddenApps(Set<String> hidden) {
+        profileSp().edit().putStringSet("hiddenApps", hidden == null ? new HashSet<>() : new HashSet<>(hidden)).apply();
+    }
+
+    static void replaceProfilePermHiddenApps(Set<String> permHidden) {
+        profileSp().edit().putStringSet("permHiddenApps", permHidden == null ? new HashSet<>() : new HashSet<>(permHidden)).apply();
+    }
+
+    static Set<String> tvOverrideHiddenApps() {
+        Set<String> hidden = new HashSet<>(sp().getStringSet("tv_hiddenApps", new HashSet<>()));
+        hidden.removeAll(tvOverridePermHiddenApps());
+        return hidden;
+    }
+
+    static Set<String> tvOverridePermHiddenApps() {
+        return new HashSet<>(sp().getStringSet("tv_permHiddenApps", new HashSet<>()));
+    }
+
+    static void replaceTvOverrideHiddenApps(Set<String> hidden) {
+        sp().edit().putStringSet("tv_hiddenApps", hidden == null ? new HashSet<>() : new HashSet<>(hidden)).apply();
+    }
+
+    static void replaceTvOverridePermHiddenApps(Set<String> permHidden) {
+        sp().edit().putStringSet("tv_permHiddenApps", permHidden == null ? new HashSet<>() : new HashSet<>(permHidden)).apply();
     }
 
     /** Temporarily hidden apps on the Apps screen (excluding permanently hidden apps). */
     static Set<String> hiddenApps() {
-        Set<String> hidden = new HashSet<>(sp().getStringSet("hiddenApps", new HashSet<>()));
-        hidden.removeAll(permHiddenApps());
-        return hidden;
+        return isTvOverrideHiddenAppsEnabled() ? tvOverrideHiddenApps() : profileHiddenApps();
     }
 
     static void setAppHidden(String pkg, boolean hidden) {
         if (pkg == null || pkg.isEmpty()) return;
-        Set<String> set = new HashSet<>(sp().getStringSet("hiddenApps", new HashSet<>()));
-        if (hidden) set.add(pkg);
-        else set.remove(pkg);
-        sp().edit().putStringSet("hiddenApps", set).apply();
+        if (isTvOverrideHiddenAppsEnabled()) {
+            Set<String> set = new HashSet<>(sp().getStringSet("tv_hiddenApps", new HashSet<>()));
+            if (hidden) set.add(pkg);
+            else set.remove(pkg);
+            sp().edit().putStringSet("tv_hiddenApps", set).apply();
+            touchCloud(CloudSyncManager.Scope.TV_DEVICE, "hidden_apps");
+        } else {
+            Set<String> set = new HashSet<>(profileSp().getStringSet("hiddenApps", new HashSet<>()));
+            if (hidden) set.add(pkg);
+            else set.remove(pkg);
+            profileSp().edit().putStringSet("hiddenApps", set).apply();
+            touchCloud(CloudSyncManager.Scope.PROFILE, "hidden_apps");
+        }
     }
 
     /** Permanently hidden apps (never shown in the Apps grid or under the Hidden tile). */
     static Set<String> permHiddenApps() {
-        return new HashSet<>(sp().getStringSet("permHiddenApps", new HashSet<>()));
+        return isTvOverrideHiddenAppsEnabled() ? tvOverridePermHiddenApps() : profilePermHiddenApps();
     }
 
     static void permanentlyHideApp(String pkg) {
         if (pkg == null || pkg.isEmpty()) return;
-        Set<String> perm = permHiddenApps();
-        perm.add(pkg);
-        Set<String> temp = new HashSet<>(sp().getStringSet("hiddenApps", new HashSet<>()));
-        temp.remove(pkg);
-        sp().edit()
-                .putStringSet("permHiddenApps", perm)
-                .putStringSet("hiddenApps", temp)
-                .apply();
+        if (isTvOverrideHiddenAppsEnabled()) {
+            Set<String> perm = tvOverridePermHiddenApps();
+            perm.add(pkg);
+            Set<String> temp = new HashSet<>(sp().getStringSet("tv_hiddenApps", new HashSet<>()));
+            temp.remove(pkg);
+            sp().edit().putStringSet("tv_permHiddenApps", perm).putStringSet("tv_hiddenApps", temp).apply();
+            touchCloud(CloudSyncManager.Scope.TV_DEVICE, "perm_hidden_apps");
+        } else {
+            Set<String> perm = profilePermHiddenApps();
+            perm.add(pkg);
+            Set<String> temp = new HashSet<>(profileSp().getStringSet("hiddenApps", new HashSet<>()));
+            temp.remove(pkg);
+            profileSp().edit().putStringSet("permHiddenApps", perm).putStringSet("hiddenApps", temp).apply();
+            touchCloud(CloudSyncManager.Scope.PROFILE, "perm_hidden_apps");
+        }
     }
 
     // MARK: - Sleep timer
@@ -1277,7 +1755,7 @@ final class Prefs {
         }
         java.util.Set<String> out = new java.util.HashSet<>();
         if (app != null) {
-            String raw = sp().getString("watchedItems", "");
+            String raw = profileSp().getString("watchedItems", "");
             if (raw != null && !raw.isEmpty()) {
                 for (String part : raw.split(",")) {
                     String k = part.trim();
@@ -1295,6 +1773,21 @@ final class Prefs {
         return watchedItems().contains(key);
     }
 
+    static synchronized void replaceWatchedItems(Set<String> keys) {
+        if (app == null) return;
+        StringBuilder sb = new StringBuilder();
+        if (keys != null) {
+            for (String k : keys) {
+                if (k == null || k.trim().isEmpty()) continue;
+                if (sb.length() > 0) sb.append(',');
+                sb.append(k.trim());
+            }
+        }
+        profileSp().edit().putString("watchedItems", sb.toString()).apply();
+        version++;
+        cachedWatchedSet = null;
+    }
+
     static synchronized void setWatchedItem(String key, boolean watched) {
         if (key == null || key.trim().isEmpty() || app == null) return;
         String trimmed = key.trim();
@@ -1306,7 +1799,7 @@ final class Prefs {
             if (sb.length() > 0) sb.append(',');
             sb.append(k);
         }
-        SharedPreferences.Editor ed = sp().edit().putString("watchedItems", sb.toString());
+        SharedPreferences.Editor ed = profileSp().edit().putString("watchedItems", sb.toString());
         if (watched) {
             ed.remove("autoUnwatchedSeason:" + trimmed);
         } else {
@@ -1315,30 +1808,31 @@ final class Prefs {
         ed.apply();
         version++;
         cachedWatchedSet = null;
+        touchCloud(CloudSyncManager.Scope.PROFILE, "watched_items");
     }
 
     /** Returns the recorded released-season count when a TV series was marked as watched, or 0 if unknown. */
     static int getWatchedSeriesSeasons(String key) {
         if (key == null || key.trim().isEmpty() || app == null) return 0;
-        return sp().getInt("watchedSeasons:" + key.trim(), 0);
+        return profileSp().getInt("watchedSeasons:" + key.trim(), 0);
     }
 
     /** Records the released-season count for a watched TV series so future seasons can auto-unwatch it. */
     static void setWatchedSeriesSeasons(String key, int seasons) {
         if (key == null || key.trim().isEmpty() || app == null || seasons <= 0) return;
-        sp().edit().putInt("watchedSeasons:" + key.trim(), seasons).apply();
+        profileSp().edit().putInt("watchedSeasons:" + key.trim(), seasons).apply();
     }
 
     /** Returns the released-season number at which this series was auto-unwatched, or 0 if none. */
     static int getAutoUnwatchedSeason(String key) {
         if (key == null || key.trim().isEmpty() || app == null) return 0;
-        return sp().getInt("autoUnwatchedSeason:" + key.trim(), 0);
+        return profileSp().getInt("autoUnwatchedSeason:" + key.trim(), 0);
     }
 
     /** Remembers that a series was auto-unwatched for {@code season} so external syncs do not re-gray it prematurely. */
     static void setAutoUnwatchedSeason(String key, int season) {
         if (key == null || key.trim().isEmpty() || app == null || season <= 0) return;
-        sp().edit().putInt("autoUnwatchedSeason:" + key.trim(), season).apply();
+        profileSp().edit().putInt("autoUnwatchedSeason:" + key.trim(), season).apply();
     }
 
     /** Custom user-reordered media keys for the Watch List row ("tv" or "movie"). */
@@ -1346,7 +1840,7 @@ final class Prefs {
         List<String> out = new ArrayList<>();
         if (app == null) return out;
         String prefKey = "movie".equalsIgnoreCase(subKind) ? "watchlistOrder_movie" : "watchlistOrder_tv";
-        String raw = sp().getString(prefKey, "");
+        String raw = profileSp().getString(prefKey, "");
         if (raw != null && !raw.isEmpty()) {
             for (String part : raw.split(",")) {
                 String k = part.trim();
@@ -1359,20 +1853,23 @@ final class Prefs {
     static void setWatchlistOrder(String subKind, List<String> order) {
         if (app == null || order == null) return;
         String prefKey = "movie".equalsIgnoreCase(subKind) ? "watchlistOrder_movie" : "watchlistOrder_tv";
+        String cloudKey = "movie".equalsIgnoreCase(subKind) ? "watchlist_order_movie" : "watchlist_order_tv";
         StringBuilder sb = new StringBuilder();
         for (String k : order) {
             if (k == null || k.trim().isEmpty()) continue;
             if (sb.length() > 0) sb.append(',');
             sb.append(k.trim());
         }
-        put(prefKey, sb.toString());
+        putProfile(prefKey, sb.toString(), cloudKey);
     }
 
     /** Clears custom manual order for Watch List so default similarity sorting takes effect. */
     static void clearWatchlistOrder(String subKind) {
         if (app == null) return;
         String prefKey = "movie".equalsIgnoreCase(subKind) ? "watchlistOrder_movie" : "watchlistOrder_tv";
-        sp().edit().remove(prefKey).apply();
+        String cloudKey = "movie".equalsIgnoreCase(subKind) ? "watchlist_order_movie" : "watchlist_order_tv";
+        profileSp().edit().remove(prefKey).apply();
+        touchCloud(CloudSyncManager.Scope.PROFILE, cloudKey);
     }
 
     /**
@@ -1435,6 +1932,7 @@ final class Prefs {
         if (app != null) {
             put("omdbKey", clean);
             Secrets.putSecret(app, Secrets.OMDB_KEY, clean);
+            touchCloudSecret(CloudSyncManager.Scope.HOUSEHOLD, Secrets.OMDB_KEY);
         }
     }
 
@@ -1449,6 +1947,7 @@ final class Prefs {
         if (app != null) {
             put("mdblistKey", clean);
             Secrets.putSecret(app, Secrets.MDBLIST_KEY, clean);
+            touchCloudSecret(CloudSyncManager.Scope.HOUSEHOLD, Secrets.MDBLIST_KEY);
         }
     }
 
@@ -1463,27 +1962,36 @@ final class Prefs {
         if (app != null) {
             put("geminiKey", clean);
             Secrets.putSecret(app, Secrets.GEMINI_API_KEY, clean);
+            touchCloudSecret(CloudSyncManager.Scope.HOUSEHOLD, Secrets.GEMINI_API_KEY);
         }
     }
 
-    /** Runtime override or Config fallback for Supabase URL. */
+    /** Runtime override, hardware-encrypted Secrets bootstrap, or Config fallback for Supabase URL. */
     static String supabaseUrl() {
         String given = app != null ? sp().getString("supabaseUrl", "").trim() : "";
-        return !given.isEmpty() ? given : (Config.SUPABASE_URL == null ? "" : Config.SUPABASE_URL.trim());
+        return resolveKeyWithVaultFallback(given, app, Secrets.SUPABASE_URL, Config.SUPABASE_URL);
     }
 
     static void setSupabaseUrl(String v) {
-        if (app != null) put("supabaseUrl", v == null ? "" : v.trim());
+        String clean = v == null ? "" : v.trim();
+        if (app != null) {
+            put("supabaseUrl", clean);
+            Secrets.putSecret(app, Secrets.SUPABASE_URL, clean);
+        }
     }
 
-    /** Runtime override or Config fallback for Supabase Anon Key. */
+    /** Runtime override, hardware-encrypted Secrets bootstrap, or Config fallback for Supabase Anon Key. */
     static String supabaseAnonKey() {
         String given = app != null ? sp().getString("supabaseAnonKey", "").trim() : "";
-        return !given.isEmpty() ? given : (Config.SUPABASE_ANON_KEY == null ? "" : Config.SUPABASE_ANON_KEY.trim());
+        return resolveKeyWithVaultFallback(given, app, Secrets.SUPABASE_ANON_KEY, Config.SUPABASE_ANON_KEY);
     }
 
     static void setSupabaseAnonKey(String v) {
-        if (app != null) put("supabaseAnonKey", v == null ? "" : v.trim());
+        String clean = v == null ? "" : v.trim();
+        if (app != null) {
+            put("supabaseAnonKey", clean);
+            Secrets.putSecret(app, Secrets.SUPABASE_ANON_KEY, clean);
+        }
     }
 
     /** Paired Gaming PC authentication token (stored locally & in hardware-encrypted Secrets vault). Never logged. */
@@ -1498,9 +2006,10 @@ final class Prefs {
             sp().edit().putString("gamingPcToken", clean).commit();
         }
         Secrets.putSecret(app, Secrets.GAMING_PC_TOKEN, clean);
+        touchCloudSecret(CloudSyncManager.Scope.HOUSEHOLD, Secrets.GAMING_PC_TOKEN);
     }
 
-    // MARK: - Native Gaming Stream Settings (Zero External Client UI)
+    // MARK: - Native Gaming Stream Settings (Per-TV, synced in tv_devices.tv_settings)
 
     public static String gamingResolution() {
         if (app == null) return "1080p";
@@ -1509,7 +2018,10 @@ final class Prefs {
     }
 
     public static void setGamingResolution(String v) {
-        if (app != null) putCommitted("gamingResolution", v == null || v.trim().isEmpty() ? "1080p" : v.trim());
+        if (app != null) {
+            putCommitted("gamingResolution", v == null || v.trim().isEmpty() ? "1080p" : v.trim());
+            touchCloud(CloudSyncManager.Scope.TV_DEVICE, "gaming_stream");
+        }
     }
 
     public static int gamingFps() {
@@ -1518,7 +2030,10 @@ final class Prefs {
 
     public static void setGamingFps(int fps) {
         int clamped = (fps == 30 || fps == 60 || fps == 90 || fps == 120) ? fps : 60;
-        if (app != null) sp().edit().putInt("gamingFps", clamped).commit();
+        if (app != null) {
+            sp().edit().putInt("gamingFps", clamped).commit();
+            touchCloud(CloudSyncManager.Scope.TV_DEVICE, "gaming_stream");
+        }
     }
 
     public static int gamingBitrateMbps() {
@@ -1527,7 +2042,10 @@ final class Prefs {
 
     public static void setGamingBitrateMbps(int mbps) {
         int clamped = Math.max(5, Math.min(150, mbps));
-        if (app != null) sp().edit().putInt("gamingBitrateMbps", clamped).commit();
+        if (app != null) {
+            sp().edit().putInt("gamingBitrateMbps", clamped).commit();
+            touchCloud(CloudSyncManager.Scope.TV_DEVICE, "gaming_stream");
+        }
     }
 
     public static String gamingFramePacing() {
@@ -1537,7 +2055,10 @@ final class Prefs {
     }
 
     public static void setGamingFramePacing(String v) {
-        if (app != null) putCommitted("gamingFramePacing", v == null || v.trim().isEmpty() ? "balanced" : v.trim());
+        if (app != null) {
+            putCommitted("gamingFramePacing", v == null || v.trim().isEmpty() ? "balanced" : v.trim());
+            touchCloud(CloudSyncManager.Scope.TV_DEVICE, "gaming_stream");
+        }
     }
 
     public static String gamingCodec() {
@@ -1547,7 +2068,10 @@ final class Prefs {
     }
 
     public static void setGamingCodec(String v) {
-        if (app != null) putCommitted("gamingCodec", v == null || v.trim().isEmpty() ? "auto" : v.trim());
+        if (app != null) {
+            putCommitted("gamingCodec", v == null || v.trim().isEmpty() ? "auto" : v.trim());
+            touchCloud(CloudSyncManager.Scope.TV_DEVICE, "gaming_stream");
+        }
     }
 
     public static boolean gamingHdr() {
@@ -1555,7 +2079,10 @@ final class Prefs {
     }
 
     public static void setGamingHdr(boolean enabled) {
-        if (app != null) putCommitted("gamingHdr", enabled);
+        if (app != null) {
+            putCommitted("gamingHdr", enabled);
+            touchCloud(CloudSyncManager.Scope.TV_DEVICE, "gaming_stream");
+        }
     }
 
     public static String gamingAudioConfig() {
@@ -1565,7 +2092,10 @@ final class Prefs {
     }
 
     public static void setGamingAudioConfig(String v) {
-        if (app != null) putCommitted("gamingAudioConfig", v == null || v.trim().isEmpty() ? "stereo" : v.trim());
+        if (app != null) {
+            putCommitted("gamingAudioConfig", v == null || v.trim().isEmpty() ? "stereo" : v.trim());
+            touchCloud(CloudSyncManager.Scope.TV_DEVICE, "gaming_stream");
+        }
     }
 
     public static boolean gamingPlayAudioOnPc() {
@@ -1573,7 +2103,10 @@ final class Prefs {
     }
 
     public static void setGamingPlayAudioOnPc(boolean enabled) {
-        if (app != null) putCommitted("gamingPlayAudioOnPc", enabled);
+        if (app != null) {
+            putCommitted("gamingPlayAudioOnPc", enabled);
+            touchCloud(CloudSyncManager.Scope.TV_DEVICE, "gaming_stream");
+        }
     }
 
     public static boolean gamingRumble() {
@@ -1581,7 +2114,10 @@ final class Prefs {
     }
 
     public static void setGamingRumble(boolean enabled) {
-        if (app != null) putCommitted("gamingRumble", enabled);
+        if (app != null) {
+            putCommitted("gamingRumble", enabled);
+            touchCloud(CloudSyncManager.Scope.TV_DEVICE, "gaming_stream");
+        }
     }
 
     public static boolean gamingMouseEmulation() {
@@ -1589,7 +2125,10 @@ final class Prefs {
     }
 
     public static void setGamingMouseEmulation(boolean enabled) {
-        if (app != null) putCommitted("gamingMouseEmulation", enabled);
+        if (app != null) {
+            putCommitted("gamingMouseEmulation", enabled);
+            touchCloud(CloudSyncManager.Scope.TV_DEVICE, "gaming_stream");
+        }
     }
 
     public static boolean gamingPerfOverlay() {
@@ -1597,7 +2136,10 @@ final class Prefs {
     }
 
     public static void setGamingPerfOverlay(boolean enabled) {
-        if (app != null) putCommitted("gamingPerfOverlay", enabled);
+        if (app != null) {
+            putCommitted("gamingPerfOverlay", enabled);
+            touchCloud(CloudSyncManager.Scope.TV_DEVICE, "gaming_stream");
+        }
     }
 
     public static boolean gamingOptimizeSettings() {

@@ -71,12 +71,16 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.HttpURLConnection;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -299,12 +303,108 @@ public final class RemoteAppActivity extends Activity {
     }
 
     /**
-     * Scans the phone's active Wi-Fi {@code /24} IPv4 subnet (plus any hint subnet) using parallel
-     * native Java sockets ({@code 180ms} connect timeout + {@code GET /api/auth/config} verification).
-     * Completes in ~150-220ms and completely avoids Android WebView's 6-connection HTTP pool limit.
+     * Phase 1 (Instant ~15-240ms): Broadcasts {@code SOARTV_TV_DISCOVER_V1} on UDP port {@code 8484}
+     * to discover ALL active household Android TVs on the LAN regardless of DHCP IP changes.
+     */
+    static List<String> discoverTvsViaUdp(int port, int listenTimeoutMs) {
+        int targetPort = port > 0 ? port : DEFAULT_TV_PORT;
+        List<String> replies = new ArrayList<>();
+        Set<String> seenKeys = new LinkedHashSet<>();
+        byte[] probe = "{\"op\":\"SOARTV_TV_DISCOVER_V1\"}".getBytes(StandardCharsets.UTF_8);
+        try (DatagramSocket sock = new DatagramSocket()) {
+            sock.setBroadcast(true);
+            sock.setSoTimeout(120);
+
+            Set<InetAddress> broadcastTargets = new LinkedHashSet<>();
+            try {
+                broadcastTargets.add(InetAddress.getByName("255.255.255.255"));
+            } catch (Exception ignored) {
+            }
+            try {
+                Enumeration<NetworkInterface> nets = NetworkInterface.getNetworkInterfaces();
+                while (nets != null && nets.hasMoreElements()) {
+                    NetworkInterface nif = nets.nextElement();
+                    if (nif == null || !nif.isUp() || nif.isLoopback()) continue;
+                    for (InterfaceAddress ia : nif.getInterfaceAddresses()) {
+                        if (ia != null && ia.getBroadcast() != null) {
+                            broadcastTargets.add(ia.getBroadcast());
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+
+            for (InetAddress target : broadcastTargets) {
+                try {
+                    sock.send(new DatagramPacket(probe, probe.length, target, targetPort));
+                } catch (IOException ignored) {
+                }
+            }
+
+            long deadline = System.currentTimeMillis() + Math.max(120, listenTimeoutMs);
+            byte[] buf = new byte[1024];
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    DatagramPacket pkt = new DatagramPacket(buf, buf.length);
+                    sock.receive(pkt);
+                    String text = new String(pkt.getData(), pkt.getOffset(), pkt.getLength(), StandardCharsets.UTF_8).trim();
+                    if (text.startsWith("{") && text.contains("SOARTV_TV_HERE_V1")) {
+                        String senderIp = pkt.getAddress() != null ? pkt.getAddress().getHostAddress() : "";
+                        String dedupeKey = extractJsonStringField(text, "deviceId");
+                        if (dedupeKey.isEmpty()) dedupeKey = senderIp;
+                        if (!dedupeKey.isEmpty() && seenKeys.add(dedupeKey)) {
+                            replies.add(text);
+                        }
+                    }
+                } catch (SocketTimeoutException ignored) {
+                    if (!replies.isEmpty()) break;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return replies;
+    }
+
+    private static String extractJsonStringField(String json, String fieldName) {
+        if (json == null || fieldName == null) return "";
+        String needle = "\"" + fieldName + "\":\"";
+        int idx = json.indexOf(needle);
+        if (idx < 0) return "";
+        int start = idx + needle.length();
+        int end = json.indexOf('"', start);
+        return end > start ? json.substring(start, end).trim() : "";
+    }
+
+    private static int extractJsonIntField(String json, String fieldName, int fallback) {
+        if (json == null || fieldName == null) return fallback;
+        String needle = "\"" + fieldName + "\":";
+        int idx = json.indexOf(needle);
+        if (idx < 0) return fallback;
+        int start = idx + needle.length();
+        int end = start;
+        while (end < json.length() && Character.isDigit(json.charAt(end))) end++;
+        if (end <= start) return fallback;
+        try {
+            return Integer.parseInt(json.substring(start, end));
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    /**
+     * Discovers a SoarTV on LAN: Phase 1 runs instant UDP broadcast (~15ms), Phase 2 falls back to
+     * parallel native Java TCP {@code /24} subnet scan ({@code 180ms} connect timeout).
      */
     static String discoverTvOnLan(String hintUrl, int port) {
         int targetPort = port > 0 ? port : DEFAULT_TV_PORT;
+        List<String> udpReplies = discoverTvsViaUdp(targetPort, 240);
+        for (String reply : udpReplies) {
+            String lanIp = extractJsonStringField(reply, "lanIp");
+            int replyPort = extractJsonIntField(reply, "port", targetPort);
+            if (!lanIp.isEmpty() && !lanIp.startsWith("127.")) {
+                return "http://" + lanIp + ":" + (replyPort > 0 ? replyPort : targetPort);
+            }
+        }
         Set<String> prefixes = new LinkedHashSet<>();
 
         // 1. Inspect the phone's actual active Wi-Fi / LAN IPv4 interfaces first
@@ -1392,6 +1492,19 @@ public final class RemoteAppActivity extends Activity {
                 return found;
             }
             return lastDiscoveredTvUrl != null ? lastDiscoveredTvUrl : "";
+        }
+
+        @JavascriptInterface
+        public String discoverAllTvsOnLan() {
+            if (!trustedOriginActive) return "[]";
+            List<String> replies = discoverTvsViaUdp(DEFAULT_TV_PORT, 320);
+            StringBuilder sb = new StringBuilder("[");
+            for (int i = 0; i < replies.size(); i++) {
+                if (i > 0) sb.append(',');
+                sb.append(replies.get(i));
+            }
+            sb.append(']');
+            return sb.toString();
         }
 
         @JavascriptInterface

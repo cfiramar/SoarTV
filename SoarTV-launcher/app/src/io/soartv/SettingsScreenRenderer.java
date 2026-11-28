@@ -15,7 +15,10 @@ import android.text.TextUtils;
 
 import java.io.File;
 import java.io.InputStream;
+import java.text.Normalizer;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -23,6 +26,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.regex.Pattern;
 
 /**
  * Encapsulates recursive 2-column (60% Left / 40% Right, or 100% Full-Width Leaf) Settings screen rendering,
@@ -48,6 +52,87 @@ public final class SettingsScreenRenderer {
     static final float LEFT_RAIL_FRACTION = 0.38f;
     /** Live preview split ratio (Screensaver Clock & Galleries): 42% options / 58% large 4K preview. */
     static final float PREVIEW_LEFT_FRACTION = 0.42f;
+    /**
+     * Target vertical anchor fraction for the focused row when overflowing rows exist below (66% down
+     * the viewport, leaving ~34% visible below the hovered row), clamping smoothly to the bottom when
+     * no more hidden rows exist so empty rows are never shown.
+     */
+    static final float SCROLL_ANCHOR_FRACTION = 0.66f;
+    /** Minimum selectable rows in a terminal leaf Settings column to automatically enable the inline search bar. */
+    static final int SEARCHABLE_MIN_ITEMS = 15;
+    /** Hit-test outcomes for {@link #hitTestSettingsSearchBar(float, float)}. */
+    static final int SEARCH_HIT_NONE = 0;
+    static final int SEARCH_HIT_BAR = 1;
+    static final int SEARCH_HIT_CLEAR = 2;
+
+    private static final Pattern DIACRITICS_PATTERN = Pattern.compile("\\p{InCombiningDiacriticalMarks}+");
+    private static final Map<String, String> TZ_HUB_SEARCH_ALIASES = buildTimezoneHubAliases();
+
+    private static Map<String, String> buildTimezoneHubAliases() {
+        Map<String, String> m = new HashMap<>(80);
+        m.put("HNL", "hawaii usa united states america");
+        m.put("ANC", "alaska usa united states america");
+        m.put("YVR", "canada british columbia");
+        m.put("LAX", "california usa united states america");
+        m.put("PHX", "arizona usa united states america");
+        m.put("DEN", "colorado usa united states america");
+        m.put("MEX", "mexico");
+        m.put("CHI", "illinois usa united states america");
+        m.put("BOG", "colombia");
+        m.put("LIM", "peru");
+        m.put("YYZ", "canada ontario");
+        m.put("NYC", "new york usa united states america east coast");
+        m.put("CCS", "venezuela");
+        m.put("SCL", "chile");
+        m.put("YHZ", "canada nova scotia");
+        m.put("YYT", "canada newfoundland");
+        m.put("BUE", "argentina");
+        m.put("SAO", "brazil brasil");
+        m.put("REK", "iceland");
+        m.put("UTC", "gmt greenwich universal coordinated");
+        m.put("LIS", "portugal");
+        m.put("DUB", "ireland");
+        m.put("LON", "uk united kingdom england britain");
+        m.put("MAD", "spain espana");
+        m.put("PAR", "france");
+        m.put("AMS", "netherlands holland dutch");
+        m.put("ZRH", "switzerland swiss");
+        m.put("BER", "germany deutschland");
+        m.put("ROM", "italy italia");
+        m.put("STO", "sweden");
+        m.put("VIE", "austria");
+        m.put("PRG", "czech republic czechia");
+        m.put("WAW", "poland");
+        m.put("ATH", "greece");
+        m.put("BUH", "romania");
+        m.put("CAI", "egypt");
+        m.put("JNB", "south africa");
+        m.put("TLV", "israel tel aviv jerusalem");
+        m.put("IST", "turkey turkiye");
+        m.put("MOW", "russia");
+        m.put("RUH", "saudi arabia");
+        m.put("NBO", "kenya");
+        m.put("THR", "iran");
+        m.put("DXB", "uae united arab emirates");
+        m.put("KBL", "afghanistan");
+        m.put("KHI", "pakistan");
+        m.put("BOM", "india mumbai kolkata delhi");
+        m.put("KTM", "nepal");
+        m.put("DAC", "bangladesh");
+        m.put("BKK", "thailand");
+        m.put("JKT", "indonesia");
+        m.put("SIN", "singapore");
+        m.put("HKG", "hong kong china");
+        m.put("TPE", "taiwan");
+        m.put("MNL", "philippines");
+        m.put("PER", "australia");
+        m.put("SEL", "south korea");
+        m.put("TYO", "japan");
+        m.put("ADL", "australia");
+        m.put("SYD", "australia");
+        m.put("AKL", "new zealand");
+        return Collections.unmodifiableMap(m);
+    }
 
     private static final int STATUS_POSITIVE_DARK = 0xFF34D399;
     private static final int STATUS_POSITIVE_LIGHT = 0xFF059669;
@@ -59,6 +144,8 @@ public final class SettingsScreenRenderer {
     private RectF tmpToggleRect;
     private RectF tmpPreviewBox;
     private RectF tmpClockCardRect;
+    private RectF tmpSearchBarRect;
+    private RectF tmpSearchClearRect;
     private Path tmpPreviewClip;
 
     private LinearGradient clockPreviewBgGrad;
@@ -87,6 +174,8 @@ public final class SettingsScreenRenderer {
             tmpToggleRect = new RectF();
             tmpPreviewBox = new RectF();
             tmpClockCardRect = new RectF();
+            tmpSearchBarRect = new RectF();
+            tmpSearchClearRect = new RectF();
             tmpPreviewClip = new Path();
         }
     }
@@ -205,6 +294,206 @@ public final class SettingsScreenRenderer {
     }
 
     /**
+     * Computes the vertical pixel scroll offset for a Settings column list so that when overflowing
+     * rows exist below, the focused row stays anchored around {@link #SCROLL_ANCHOR_FRACTION} (66%
+     * down the viewport) — exposing more upcoming rows underneath — while clamping smoothly to
+     * {@code totalContentH - viewportH} at the bottom (never showing empty trailing rows) and to
+     * {@code 0} at the top.
+     */
+    public static float computeColumnScrollY(
+            float totalContentH,
+            float viewportH,
+            float selTop,
+            float selBottom) {
+        if (totalContentH <= viewportH || viewportH <= 0f) return 0f;
+        float maxScroll = totalContentH - viewportH;
+        float selCenter = (selTop + selBottom) * 0.5f;
+        float desired = selCenter - viewportH * SCROLL_ANCHOR_FRACTION;
+        float scrollY = Math.max(0f, Math.min(maxScroll, desired));
+        if (selBottom - scrollY > viewportH) {
+            scrollY = Math.min(maxScroll, selBottom - viewportH);
+        }
+        if (selTop - scrollY < 0f) {
+            scrollY = Math.max(0f, selTop);
+        }
+        return Math.max(0f, Math.min(maxScroll, scrollY));
+    }
+
+    /**
+     * Returns whether a full-width terminal leaf Settings column should display an inline Search Bar
+     * (Second Clock Timezone, TV Shows &amp; Movies Genres, SoarTV Display Language, Controller Color
+     * Swatches, or any leaf column with at least {@link #SEARCHABLE_MIN_ITEMS} selectable rows).
+     */
+    public static boolean isSearchableColumn(SettingsTree.Node node) {
+        if (node == null || !node.hasChildren() || anyGrandchild(node) || isPreviewColumn(node)) {
+            return false;
+        }
+        if ("ss_tz".equals(node.id)
+                || "hg_tv_genres".equals(node.id)
+                || "hg_movie_genres".equals(node.id)
+                || "sys_soartv_lang".equals(node.id)
+                || "gaming_colors_rainbow".equals(node.id)) {
+            return true;
+        }
+        int selectable = 0;
+        for (SettingsTree.Node child : node.children) {
+            if (child != null && !child.isSectionHeader()) {
+                selectable++;
+                if (selectable >= SEARCHABLE_MIN_ITEMS) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Returns a tailored placeholder hint for the inline Search Bar of a searchable Settings column.
+     */
+    public static String searchPlaceholderForColumn(SettingsTree.Node node) {
+        if (node == null) return "Search options…";
+        if ("ss_tz".equals(node.id)) return "Search city, country, timezone, or UTC offset…";
+        if ("hg_tv_genres".equals(node.id)) return "Search TV Show genres…";
+        if ("hg_movie_genres".equals(node.id)) return "Search Movie genres…";
+        if ("sys_soartv_lang".equals(node.id)) return "Search language (e.g. English, Deutsch, Japanese)…";
+        if ("gaming_colors_rainbow".equals(node.id)) return "Search color (e.g. Blue, Emerald, Pink)…";
+        return "Search options…";
+    }
+
+    /**
+     * Normalizes text for accent- and case-insensitive Settings search (e.g. {@code "São Paulo"} -> {@code "sao paulo"}).
+     */
+    public static String normalizeSearchText(String raw) {
+        if (raw == null || raw.isEmpty()) return "";
+        String decomposed = Normalizer.normalize(raw, Normalizer.Form.NFD);
+        String stripped = DIACRITICS_PATTERN.matcher(decomposed).replaceAll("");
+        return stripped.toLowerCase(Locale.ROOT).trim();
+    }
+
+    /**
+     * Filters and ranks child nodes of a searchable Settings column against {@code rawQuery}.
+     * Supports multi-token queries, diacritic folding, IANA timezone/airport-code/country matching
+     * for {@code ss_tz}, and English language-name matching for {@code sys_soartv_lang}.
+     */
+    public static List<SettingsTree.Node> filterNodesForSearch(
+            SettingsTree.Node parent,
+            List<SettingsTree.Node> items,
+            String rawQuery) {
+        if (items == null || items.isEmpty()) return Collections.emptyList();
+        String normQ = normalizeSearchText(rawQuery);
+        if (normQ.isEmpty()) return items;
+
+        String[] tokens = normQ.split("\\s+");
+        List<SettingsTree.Node> tier4 = new ArrayList<>();
+        List<SettingsTree.Node> tier3 = new ArrayList<>();
+        List<SettingsTree.Node> tier2 = new ArrayList<>();
+        List<SettingsTree.Node> tier1 = new ArrayList<>();
+        List<SettingsTree.Node> tier0 = new ArrayList<>();
+
+        for (SettingsTree.Node n : items) {
+            if (n == null || n.isSectionHeader()) continue;
+            String titleNorm = normalizeSearchText(n.title);
+            StringBuilder hay = new StringBuilder(96);
+            hay.append(titleNorm);
+            if (!n.subtitle.isEmpty()) hay.append(' ').append(normalizeSearchText(n.subtitle));
+            if (!n.value.isEmpty()) hay.append(' ').append(normalizeSearchText(n.value));
+            appendDomainSearchMetadata(n, hay);
+
+            String haystack = hay.toString();
+            boolean allMatched = true;
+            for (String tok : tokens) {
+                if (!tok.isEmpty() && !haystack.contains(tok)) {
+                    allMatched = false;
+                    break;
+                }
+            }
+            if (!allMatched) continue;
+
+            if (titleNorm.equals(normQ)) {
+                tier4.add(n);
+            } else if (titleNorm.startsWith(normQ)) {
+                tier3.add(n);
+            } else if (containsWordStartingWith(titleNorm, normQ)) {
+                tier2.add(n);
+            } else if (titleNorm.contains(normQ)) {
+                tier1.add(n);
+            } else {
+                tier0.add(n);
+            }
+        }
+
+        List<SettingsTree.Node> out = new ArrayList<>(
+                tier4.size() + tier3.size() + tier2.size() + tier1.size() + tier0.size());
+        out.addAll(tier4);
+        out.addAll(tier3);
+        out.addAll(tier2);
+        out.addAll(tier1);
+        out.addAll(tier0);
+        return out;
+    }
+
+    private static boolean containsWordStartingWith(String haystack, String needle) {
+        if (haystack.isEmpty() || needle.isEmpty()) return false;
+        int len = haystack.length();
+        for (int i = 0; i < len; i++) {
+            char ch = haystack.charAt(i);
+            boolean boundary = (i == 0) || !Character.isLetterOrDigit(haystack.charAt(i - 1));
+            if (boundary && Character.isLetterOrDigit(ch) && haystack.startsWith(needle, i)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void appendDomainSearchMetadata(SettingsTree.Node node, StringBuilder out) {
+        if (node == null || node.id == null) return;
+        if (node.id.startsWith("ss_tz:")) {
+            String[] parts = node.id.substring("ss_tz:".length()).split(":", 2);
+            if (parts.length >= 1 && !parts[0].isEmpty()) {
+                out.append(' ').append(normalizeSearchText(parts[0].replace('/', ' ').replace('_', ' ')));
+            }
+            if (parts.length >= 2 && !parts[1].isEmpty()) {
+                String code = parts[1].toUpperCase(Locale.ROOT);
+                out.append(' ').append(code.toLowerCase(Locale.ROOT));
+                String aliases = TZ_HUB_SEARCH_ALIASES.get(code);
+                if (aliases != null) {
+                    out.append(' ').append(aliases);
+                }
+            }
+        } else if (node.id.startsWith("sys_soartv_lang:")) {
+            String code = node.id.substring("sys_soartv_lang:".length());
+            if (!code.isEmpty() && !"auto".equalsIgnoreCase(code)) {
+                out.append(' ').append(normalizeSearchText(code));
+                try {
+                    Locale loc = Locale.forLanguageTag(code);
+                    String engName = loc.getDisplayLanguage(Locale.ENGLISH);
+                    if (engName != null && !engName.isEmpty()) {
+                        out.append(' ').append(normalizeSearchText(engName));
+                    }
+                    String engCountry = loc.getDisplayCountry(Locale.ENGLISH);
+                    if (engCountry != null && !engCountry.isEmpty()) {
+                        out.append(' ').append(normalizeSearchText(engCountry));
+                    }
+                } catch (Throwable ignored) {
+                }
+                if ("zh-CN".equalsIgnoreCase(code)) out.append(" chinese simplified mandarin");
+                else if ("zh-TW".equalsIgnoreCase(code)) out.append(" chinese traditional taiwan");
+            }
+        }
+    }
+
+    /**
+     * Hit-tests pointer coordinates against the inline Settings Search Bar and its Clear pill.
+     */
+    int hitTestSettingsSearchBar(float x, float y) {
+        if (tmpSearchClearRect != null && !tmpSearchClearRect.isEmpty() && tmpSearchClearRect.contains(x, y)) {
+            return SEARCH_HIT_CLEAR;
+        }
+        if (tmpSearchBarRect != null && !tmpSearchBarRect.isEmpty() && tmpSearchBarRect.contains(x, y)) {
+            return SEARCH_HIT_BAR;
+        }
+        return SEARCH_HIT_NONE;
+    }
+
+    /**
      * Renders the complete Native Two-Panel (38% Compact Left Rail / 62% Spacious Right Pane, 42%/58%
      * Live Preview Split, or 100% Full-Width Leaf) Settings screen with Liquid Glass controls.
      */
@@ -240,14 +529,71 @@ public final class SettingsScreenRenderer {
             RectF tmp,
             Executor loaderExecutor,
             Runnable onPreviewDecodedOnUi) {
+        drawSettingsSplitScreen(
+                ctx, c, settingsRoot, leftParent, null, settingsPathIds, leftIdx,
+                settingsFocusRight, settingsRightIndex, cardsZoneFocused, reorderingGenre,
+                "", false, false,
+                k, marginVirtual, clockText, dateText, lInkColor, lDimColor, whiteColor,
+                shadowBlurVirtual, isDark, fill, border, shadow, imagePaint,
+                lCardTitle, lSubTab, lSubTabOn, fitPaint, shadows, tmp,
+                loaderExecutor, onPreviewDecodedOnUi);
+    }
+
+    /**
+     * Full overload supporting cached filtered node lists and inline Search Bar chrome for long leaf columns.
+     */
+    void drawSettingsSplitScreen(
+            Context ctx,
+            Canvas c,
+            SettingsTree.Node settingsRoot,
+            SettingsTree.Node leftParent,
+            List<SettingsTree.Node> displayLeftList,
+            List<String> settingsPathIds,
+            int leftIdx,
+            boolean settingsFocusRight,
+            int settingsRightIndex,
+            boolean cardsZoneFocused,
+            boolean reorderingGenre,
+            String searchQuery,
+            boolean searchBarFocused,
+            boolean searchClearFocused,
+            float k,
+            float marginVirtual,
+            String clockText,
+            String dateText,
+            int lInkColor,
+            int lDimColor,
+            int whiteColor,
+            float shadowBlurVirtual,
+            boolean isDark,
+            Paint fill,
+            Paint border,
+            Paint shadow,
+            Paint imagePaint,
+            Paint lCardTitle,
+            Paint lSubTab,
+            Paint lSubTabOn,
+            TextPaint fitPaint,
+            Shadows shadows,
+            RectF tmp,
+            Executor loaderExecutor,
+            Runnable onPreviewDecodedOnUi) {
         ensureScratchInitialized();
-        List<SettingsTree.Node> leftList = leftParent != null ? leftParent.children : Collections.emptyList();
+        tmpSearchBarRect.setEmpty();
+        tmpSearchClearRect.setEmpty();
+
+        List<SettingsTree.Node> leftList = displayLeftList != null
+                ? displayLeftList
+                : (leftParent != null ? leftParent.children : Collections.emptyList());
         int clampedLeftIdx = leftList.isEmpty() ? 0 : nextSelectableIndex(leftList, leftIdx, 0);
         SettingsTree.Node hoveredLeft = (leftList.isEmpty() || clampedLeftIdx < 0 || clampedLeftIdx >= leftList.size())
                 ? null : leftList.get(clampedLeftIdx);
 
         boolean isLastColumn = isLastColumnFullWidth(settingsPathIds, leftParent);
         boolean isPreviewSplit = !isLastColumn && isPreviewColumn(leftParent);
+        boolean showSearchBar = isLastColumn && isSearchableColumn(leftParent) && !reorderingGenre;
+        String safeQuery = searchQuery == null ? "" : searchQuery;
+        boolean hasQuery = !safeQuery.trim().isEmpty();
 
         float topY = 122 * k;
         float footerH = 42 * k;
@@ -305,6 +651,7 @@ public final class SettingsScreenRenderer {
             }
         }
         int primaryInk = isDark ? whiteColor : lInkColor;
+        int invPrimaryInk = isDark ? lInkColor : whiteColor;
         int dimInk = isDark ? 0xFFD1D1D6 : lDimColor;
         float headerY = topY + 44 * k;
         float headerTextX = leftColX + 28 * k;
@@ -312,10 +659,31 @@ public final class SettingsScreenRenderer {
             Symbols.draw(ctx, c, "chevron_left", leftColX + 34 * k, headerY - 8 * k, 19 * k, primaryInk);
             headerTextX = leftColX + 54 * k;
         }
+        float headerRightReserve = 0f;
+        if (showSearchBar && leftParent != null && leftParent.value != null && !leftParent.value.isEmpty()) {
+            fitPaint.set(lSubTabOn);
+            fitPaint.setTextSize(17.5f * k);
+            String activeVal = Ui.tr(leftParent.value);
+            float badgeW = Math.min(300 * k, fitPaint.measureText(activeVal) + 28 * k);
+            float badgeH = 34 * k;
+            float badgeR = leftColX + leftColW - 24 * k;
+            float badgeL = badgeR - badgeW;
+            float badgeT = topY + 18 * k;
+            tmp.set(badgeL, badgeT, badgeR, badgeT + badgeH);
+            fill.setShader(null);
+            fill.setColor(isDark ? 0x1EFFFFFF : 0x14000000);
+            c.drawRoundRect(tmp, badgeH / 2f, badgeH / 2f, fill);
+            fitPaint.setColor(dimInk);
+            String clippedBadge = TextUtils.ellipsize(activeVal, fitPaint, badgeW - 22 * k, TextUtils.TruncateAt.END).toString();
+            c.drawText(clippedBadge, tmp.centerX() - fitPaint.measureText(clippedBadge) / 2f,
+                    tmp.centerY() + Ui.halfCap(fitPaint), fitPaint);
+            headerRightReserve = badgeW + 20 * k;
+        }
         fitPaint.set(lCardTitle);
         fitPaint.setTextSize(24.5f * k);
         fitPaint.setColor(primaryInk);
-        String crumbLine = TextUtils.ellipsize(crumb.toString(), fitPaint, leftColW - 72 * k, TextUtils.TruncateAt.START).toString();
+        String crumbLine = TextUtils.ellipsize(crumb.toString(), fitPaint,
+                Math.max(120 * k, leftColW - 72 * k - headerRightReserve), TextUtils.TruncateAt.START).toString();
         c.drawText(crumbLine, headerTextX, headerY, fitPaint);
 
         // Subtle divider under headers
@@ -337,13 +705,122 @@ public final class SettingsScreenRenderer {
                     fitPaint, leftColW - 56 * k, TextUtils.TruncateAt.END).toString();
             c.drawText(hintStr, leftColX + 28 * k, topY + 90 * k, fitPaint);
             leftListTopY = topY + 108 * k;
+        } else if (showSearchBar) {
+            float barH = 58 * k;
+            float barL = leftColX + 16 * k;
+            float barR = leftColX + leftColW - 16 * k;
+            float barT = topY + 74 * k;
+            float barB = barT + barH;
+            float barRad = 18 * k;
+
+            float clearReserve = 0f;
+            if (hasQuery) {
+                float clearW = 122 * k;
+                float clearGap = 12 * k;
+                tmpSearchClearRect.set(barR - clearW, barT, barR, barB);
+                clearReserve = clearW + clearGap;
+            }
+            tmpSearchBarRect.set(barL, barT, barR - clearReserve, barB);
+
+            boolean inputBoxActive = leftPanelFocused && searchBarFocused && !searchClearFocused;
+            fill.setShader(null);
+            if (inputBoxActive) {
+                tmp.set(tmpSearchBarRect);
+                tmp.offset(0, 4 * k);
+                shadow.setColor(Ui.alpha(0xFF000000, isDark ? 0.34f : 0.15f));
+                shadows.draw(c, tmp, barRad, shadowBlurVirtual * k, shadow);
+                fill.setColor(primaryInk);
+                c.drawRoundRect(tmpSearchBarRect, barRad, barRad, fill);
+            } else {
+                fill.setColor(isDark ? 0x1AFFFFFF : 0x14000000);
+                c.drawRoundRect(tmpSearchBarRect, barRad, barRad, fill);
+                border.setColor(isDark ? 0x34FFFFFF : 0x24000000);
+                c.drawRoundRect(tmpSearchBarRect, barRad, barRad, border);
+            }
+
+            int barIconInk = inputBoxActive ? invPrimaryInk : (hasQuery ? primaryInk : dimInk);
+            int barTextInk = inputBoxActive ? invPrimaryInk : primaryInk;
+            int barHintInk = inputBoxActive ? (isDark ? 0xFF48484A : 0xCCFFFFFF) : dimInk;
+
+            Symbols.draw(ctx, c, "search", tmpSearchBarRect.left + 30 * k, tmpSearchBarRect.centerY(), 22 * k, barIconInk);
+
+            float textRightBound = tmpSearchBarRect.right - 20 * k;
+            if (hasQuery) {
+                int count = leftList.size();
+                String countLabel = (count == 1) ? "1 match" : (count + " matches");
+                fitPaint.set(lSubTabOn);
+                fitPaint.setTextSize(16.5f * k);
+                float cw = fitPaint.measureText(countLabel);
+                fitPaint.setColor(barHintInk);
+                c.drawText(countLabel, textRightBound - cw, tmpSearchBarRect.centerY() + Ui.halfCap(fitPaint), fitPaint);
+                textRightBound -= (cw + 18 * k);
+            }
+
+            float textStartX = tmpSearchBarRect.left + 58 * k;
+            float availSearchW = Math.max(80 * k, textRightBound - textStartX);
+            String placeholder = Ui.tr(searchPlaceholderForColumn(leftParent));
+            String displayText = hasQuery ? safeQuery : placeholder;
+            fitPaint.set(hasQuery ? lSubTabOn : lSubTab);
+            fitPaint.setTextSize(21.5f * k);
+            fitPaint.setColor(hasQuery ? barTextInk : barHintInk);
+            String clippedSearch = TextUtils.ellipsize(
+                    displayText, fitPaint, availSearchW,
+                    hasQuery ? TextUtils.TruncateAt.START : TextUtils.TruncateAt.END).toString();
+            c.drawText(clippedSearch, textStartX, tmpSearchBarRect.centerY() + Ui.halfCap(fitPaint), fitPaint);
+
+            if (hasQuery) {
+                boolean clearActive = leftPanelFocused && searchBarFocused && searchClearFocused;
+                fill.setShader(null);
+                if (clearActive) {
+                    tmp.set(tmpSearchClearRect);
+                    tmp.offset(0, 4 * k);
+                    shadow.setColor(Ui.alpha(0xFF000000, isDark ? 0.34f : 0.15f));
+                    shadows.draw(c, tmp, barRad, shadowBlurVirtual * k, shadow);
+                    fill.setColor(primaryInk);
+                    c.drawRoundRect(tmpSearchClearRect, barRad, barRad, fill);
+                } else {
+                    fill.setColor(isDark ? 0x1AFFFFFF : 0x14000000);
+                    c.drawRoundRect(tmpSearchClearRect, barRad, barRad, fill);
+                    border.setColor(isDark ? 0x34FFFFFF : 0x24000000);
+                    c.drawRoundRect(tmpSearchClearRect, barRad, barRad, border);
+                }
+                int clearInk = clearActive ? invPrimaryInk : primaryInk;
+                Symbols.draw(ctx, c, "close", tmpSearchClearRect.left + 26 * k, tmpSearchClearRect.centerY(), 18 * k, clearInk);
+                fitPaint.set(lSubTabOn);
+                fitPaint.setTextSize(19 * k);
+                fitPaint.setColor(clearInk);
+                c.drawText(Ui.tr("Clear"), tmpSearchClearRect.left + 44 * k,
+                        tmpSearchClearRect.centerY() + Ui.halfCap(fitPaint), fitPaint);
+            }
+
+            leftListTopY = barB + 14 * k;
         }
 
-        drawSettingsColumnList(ctx, c, leftList, clampedLeftIdx, leftPanelFocused, !settingsFocusRight,
-                reorderingGenre, useCompactRail,
-                leftColX + 16 * k, leftListTopY, leftColW - 32 * k, panelBottomY - leftListTopY - 14 * k,
-                isLastColumn, k, lInkColor, lDimColor, whiteColor, shadowBlurVirtual, isDark,
-                fill, border, shadow, lSubTab, lSubTabOn, fitPaint, shadows, tmp);
+        if (showSearchBar && hasQuery && leftList.isEmpty()) {
+            float emptyCx = leftColX + leftColW / 2f;
+            float emptyCy = leftListTopY + (panelBottomY - leftListTopY) * 0.42f;
+            Symbols.draw(ctx, c, "search", emptyCx, emptyCy - 46 * k, 40 * k, Ui.alpha(dimInk, 0.7f));
+            fitPaint.set(lCardTitle);
+            fitPaint.setTextSize(25 * k);
+            fitPaint.setColor(primaryInk);
+            String noMatch = TextUtils.ellipsize(
+                    Ui.tr("No matches for \"") + safeQuery.trim() + "\"",
+                    fitPaint, leftColW - 120 * k, TextUtils.TruncateAt.END).toString();
+            c.drawText(noMatch, emptyCx - fitPaint.measureText(noMatch) / 2f, emptyCy + 10 * k, fitPaint);
+            fitPaint.set(lSubTab);
+            fitPaint.setTextSize(19.5f * k);
+            fitPaint.setColor(dimInk);
+            String subHint = Ui.tr("Press Back or Clear to show all options");
+            c.drawText(subHint, emptyCx - fitPaint.measureText(subHint) / 2f, emptyCy + 46 * k, fitPaint);
+        } else {
+            int listSelectedIdx = (showSearchBar && searchBarFocused) ? -1 : clampedLeftIdx;
+            boolean listFocused = leftPanelFocused && !(showSearchBar && searchBarFocused);
+            drawSettingsColumnList(ctx, c, leftList, listSelectedIdx, listFocused, !settingsFocusRight,
+                    reorderingGenre, useCompactRail,
+                    leftColX + 16 * k, leftListTopY, leftColW - 32 * k, panelBottomY - leftListTopY - 14 * k,
+                    isLastColumn, k, lInkColor, lDimColor, whiteColor, shadowBlurVirtual, isDark,
+                    fill, border, shadow, lSubTab, lSubTabOn, fitPaint, shadows, tmp);
+        }
 
         // Right Column (62% Active Workspace or 58% Live Preview)
         if (!isLastColumn) {
@@ -430,7 +907,8 @@ public final class SettingsScreenRenderer {
 
         // 3. Clean Single Contextual Footer Bar
         String footerHint = resolveContextualFooterHint(leftParent, hoveredLeft, settingsPathIds,
-                settingsFocusRight, isLastColumn, isPreviewSplit, reorderingGenre);
+                settingsFocusRight, isLastColumn, isPreviewSplit, reorderingGenre,
+                showSearchBar, searchBarFocused, hasQuery);
         if (!footerHint.isEmpty()) {
             fitPaint.set(lSubTab);
             fitPaint.setTextSize(17.5f * k);
@@ -447,9 +925,20 @@ public final class SettingsScreenRenderer {
             boolean focusRight,
             boolean isLastColumn,
             boolean isPreviewSplit,
-            boolean reorderingGenre) {
+            boolean reorderingGenre,
+            boolean showSearchBar,
+            boolean searchBarFocused,
+            boolean hasQuery) {
         if (reorderingGenre) {
             return "Up / Down Move Genre  \u00B7  OK Save  \u00B7  Back Cancel";
+        }
+        if (showSearchBar && searchBarFocused) {
+            return hasQuery
+                    ? "OK Edit Search  \u00B7  Right Clear  \u00B7  Down Select Result  \u00B7  Back Clear"
+                    : "OK Type to Search  \u00B7  Down Browse List  \u00B7  Left / Back Go Back";
+        }
+        if (showSearchBar && hasQuery) {
+            return "OK Select  \u00B7  Up Back to Search  \u00B7  Back Clear Search";
         }
         if (leftParent != null && leftParent.hint != null && !leftParent.hint.isEmpty() && (isLastColumn || isPreviewSplit)) {
             return leftParent.hint;
@@ -503,10 +992,11 @@ public final class SettingsScreenRenderer {
         float headerH = 26f * k;
         float gap = (compactRail ? 5f : 8f) * k;
 
-        // Compute total height & vertical scroll offset keeping selected row cleanly cushioned inside viewport
+        // Compute total height & vertical scroll offset keeping focused row at ~66% down while hidden rows remain below,
+        // and clamping cleanly to the bottom (zero empty rows) once the end of the list is in view.
         float totalContentH = 0f;
         float selTop = 0f;
-        float selBottom = rowH;
+        float selBottom = selectedIdx >= 0 ? rowH : 0f;
         for (int i = 0; i < items.size(); i++) {
             SettingsTree.Node n = items.get(i);
             float hItem = (n != null && n.isSectionHeader()) ? headerH : rowH;
@@ -520,17 +1010,9 @@ public final class SettingsScreenRenderer {
         }
         if (totalContentH > gap) totalContentH -= gap;
 
-        float scrollY = 0f;
-        if (totalContentH > height) {
-            float pad = rowH * 0.45f;
-            if (selBottom + pad > height) {
-                scrollY = selBottom + pad - height;
-            }
-            if (selTop - pad < scrollY) {
-                scrollY = Math.max(0f, selTop - pad);
-            }
-            scrollY = Math.max(0f, Math.min(totalContentH - height, scrollY));
-        }
+        float scrollY = (selectedIdx < 0)
+                ? 0f
+                : computeColumnScrollY(totalContentH, height, selTop, selBottom);
 
         c.save();
         c.clipRect(x - 8 * k, topY - 4 * k, x + width + 8 * k, topY + height + 4 * k);

@@ -814,15 +814,25 @@ var TV = (function () {
       try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { return ''; }
     },
 
-    /** Stable device identifier persisted in localStorage for Supabase tv_devices & Cloud Remote channel. */
+    /** Canonical cross-platform TV platform identifier ('lg-webos', 'samsung-tizen', or 'web'). */
+    platformId: webos ? 'lg-webos' : samsung ? 'samsung-tizen' : 'web',
+
+    /** Permanent unique TV UUID persisted in localStorage for Supabase v2 tv_devices & Cloud Remote channel. */
     deviceId: function () {
-      var key = 'soartv.deviceSlug', saved = '';
+      var key = 'soartv.deviceId', legacyKey = 'soartv.deviceSlug', saved = '';
       try { saved = localStorage.getItem(key) || ''; } catch (e) {}
       if (saved) return saved;
-      var prefix = webos ? 'webos' : samsung ? 'tizen' : 'web';
-      var rand = Math.floor(100000 + Math.random() * 900000).toString(36);
-      saved = prefix + '-tv-' + rand;
-      try { localStorage.setItem(key, saved); } catch (e) {}
+      try { saved = localStorage.getItem(legacyKey) || ''; } catch (e2) {}
+      if (!saved) {
+        if (typeof SoarTvCrypto !== 'undefined' && SoarTvCrypto.uuidV4) {
+          saved = SoarTvCrypto.uuidV4();
+        } else {
+          var prefix = webos ? 'webos' : samsung ? 'tizen' : 'web';
+          var rand = Math.floor(100000 + Math.random() * 900000).toString(36);
+          saved = prefix + '-tv-' + rand;
+        }
+      }
+      try { localStorage.setItem(key, saved); } catch (e3) {}
       return saved;
     },
 

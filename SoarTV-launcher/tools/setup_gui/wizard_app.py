@@ -292,11 +292,25 @@ class AgentPromptBuilder:
         enable_gaming: bool,
         games_dirs: str,
         custom_smarthome: Optional[List[Dict[str, Any]]] = None,
+        onboarding_mode: str = "add_tv",
+        replace_tv_id: str = "",
     ) -> str:
         """Builds a clear, human-readable instruction prompt for Claude Code, Antigravity, Cursor, or Codex."""
         plat = cls.PLATFORM_LABELS.get(tv_platform, "Smart TV")
         ip_part = f" at IP `{tv_ip.strip()}`" if tv_ip.strip() else " (ask me for my TV's Wi-Fi IP)"
         city_part = f" My city is `{city.strip()}`." if city.strip() else ""
+        cloud_line = ""
+        if onboarding_mode == "replace_tv" and replace_tv_id.strip():
+            cloud_line = (
+                f"\n- Multi-TV Cloud Onboarding: REPLACE EXISTING TV (`{replace_tv_id.strip()}`) — "
+                "seed household secrets via `send_key.py --seed-cloud`, then run "
+                f"`send_key.py <TV_IP> --link-tv --replace-tv {replace_tv_id.strip()}` so portable per-TV settings migrate cleanly across brands."
+            )
+        elif onboarding_mode == "add_tv":
+            cloud_line = (
+                "\n- Multi-TV Cloud Onboarding: Link this TV via the 3-key cloud bootstrap "
+                "(`send_key.py --seed-cloud` + `send_key.py <TV_IP> --link-tv`) so household keys and profiles hydrate automatically from Supabase."
+            )
 
         custom_entries = [
             entry for entry in (custom_smarthome or [])
@@ -338,7 +352,7 @@ class AgentPromptBuilder:
         return (
             f"Read `AGENTS.md` and `docs/agents/install-playbook.md` and help me install and configure SoarTV on my {plat}{ip_part}.{city_part}\n"
             f"{sh_line}\n"
-            f"{gm_line}\n"
+            f"{gm_line}{cloud_line}\n"
             "First save an immutable local backup of my TV's initial native state (`python3 SoarTV-launcher/tools/tv_state_backup.py <TV_IP> --backup`) before making any changes, "
             "check any keys I already saved in `SoarTV-launcher/config.properties` / `.env` (never print secret values in chat), "
             "guide me step-by-step for anything missing, verify my TV brand compatibility safely, build, and install SoarTV."
@@ -595,6 +609,103 @@ class EnvironmentInspector:
             subprocess.run([adb_bin, "disconnect"], capture_output=True, text=True, timeout=4, check=False)
 
 
+class CloudBootstrapService:
+    """
+    Coordinates SoarTV v2 Household Cloud Vault seeding, Supabase TV directory lookup, and
+    guided Replace-Existing-TV vs. Add-Additional-TV 3-key onboarding from Setup Studio.
+
+    Why: New or replacement TVs only need 3 bootstrap credentials (`supabase_url`, `supabase_anon_key`,
+    `household_key`) while all household API keys and settings hydrate automatically from Supabase.
+    What: Reuses `tools/send_key.py` crypto & PostgREST helpers without ever returning raw secrets to HTTP clients.
+    """
+
+    @staticmethod
+    def _import_send_key() -> Any:
+        tools_dir = str(Path(__file__).resolve().parent.parent)
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        import send_key as sk_mod  # type: ignore[import-not-found]
+        return sk_mod
+
+    @classmethod
+    def list_household_tvs(cls, store: SetupConfigStore) -> Dict[str, Any]:
+        """Lists active household TVs from Supabase `public.tv_devices` (sanitized non-secret fields)."""
+        sk = cls._import_send_key()
+        cfg = sk.load_local_config_map(str(store.repo_root))
+        if not (cfg.get("supabase_url") and cfg.get("supabase_anon_key") and cfg.get("household_key")):
+            return {"ok": True, "configured": False, "tvs": []}
+        try:
+            raw_tvs = sk.fetch_household_tv_devices(
+                cfg["supabase_url"], cfg["supabase_anon_key"], cfg["household_key"], active_only=True
+            )
+            safe_tvs = [
+                {
+                    "device_id": str(t.get("device_id") or ""),
+                    "device_name": str(t.get("device_name") or ""),
+                    "room_name": str(t.get("room_name") or ""),
+                    "platform": str(t.get("platform") or ""),
+                    "brand": str(t.get("brand") or ""),
+                    "lan_ip": str(t.get("lan_ip") or ""),
+                    "last_seen_at": str(t.get("last_seen_at") or ""),
+                }
+                for t in raw_tvs
+                if isinstance(t, dict) and t.get("device_id")
+            ]
+            return {"ok": True, "configured": True, "tvs": safe_tvs}
+        except Exception as exc:
+            return {"ok": False, "configured": True, "tvs": [], "error": str(exc)}
+
+    @classmethod
+    def seed_household_vault(cls, store: SetupConfigStore) -> Dict[str, Any]:
+        """Encrypts and uploads all configured household secrets + settings to Supabase."""
+        sk = cls._import_send_key()
+        cfg = sk.load_local_config_map(str(store.repo_root))
+        try:
+            return sk.seed_household_cloud(cfg)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @classmethod
+    def link_tv_bootstrap(
+        cls,
+        store: SetupConfigStore,
+        tv_ip: str,
+        tv_name: str = "",
+        tv_room: str = "",
+        replace_tv_id: str = "",
+    ) -> Dict[str, Any]:
+        """Pushes ONLY the 3 bootstrap credentials (+ optional TV name/room/replace ID) via ADB and disconnects."""
+        clean_ip = (tv_ip or "").strip()
+        if not clean_ip:
+            return {"ok": False, "error": "Enter your TV's Wi-Fi IP address first."}
+        sk = cls._import_send_key()
+        cfg = sk.load_local_config_map(str(store.repo_root))
+        if not shutil.which("adb"):
+            return {"ok": False, "error": "ADB not found on PATH."}
+        target = clean_ip if ":" in clean_ip else f"{clean_ip}:5555"
+        try:
+            r = subprocess.run(["adb", "connect", target], capture_output=True, text=True, timeout=8, check=False)
+            if "connected" not in (r.stdout or "").lower():
+                return {"ok": False, "error": f"Could not connect to {target}"}
+            sk.SERIAL[:] = ["-s", target]
+            rc = sk.link_tv_bootstrap(
+                cfg,
+                tv_name=tv_name,
+                tv_room=tv_room,
+                replace_tv_id=replace_tv_id,
+            )
+            return {
+                "ok": rc == 0,
+                "mode": "replace_tv" if replace_tv_id.strip() else "add_tv",
+                "message": "TV linked to Household Cloud (3-key bootstrap complete)." if rc == 0 else "TV link failed.",
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            sk.SERIAL[:] = []
+            subprocess.run(["adb", "disconnect"], capture_output=True, text=True, timeout=4, check=False)
+
+
 def create_setup_http_server(
     repo_root: Path,
     port: int = 8765,
@@ -699,6 +810,32 @@ def create_setup_http_server(
                 )
                 return
 
+            if parsed.path == "/api/cloud/tvs":
+                if not self._check_csrf():
+                    return
+                if sandbox:
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "configured": True,
+                            "tvs": [
+                                {
+                                    "device_id": "sandbox-tv-living-room",
+                                    "device_name": "Living Room TV (Sandbox)",
+                                    "room_name": "Living Room",
+                                    "platform": "android-tv",
+                                    "brand": "SONY",
+                                    "lan_ip": "192.168.1.50",
+                                    "last_seen_at": "2026-11-28T10:00:00Z",
+                                }
+                            ],
+                        },
+                    )
+                    return
+                self._send_json(200, CloudBootstrapService.list_household_tvs(store))
+                return
+
             self._send_json(404, {"ok": False, "error": "Not found"})
 
         def do_POST(self) -> None:
@@ -756,8 +893,40 @@ def create_setup_http_server(
                     enable_gaming=bool(body.get("enable_gaming", False)),
                     games_dirs=str(body.get("games_dirs", "")),
                     custom_smarthome=body.get("custom_smarthome") if isinstance(body.get("custom_smarthome"), list) else None,
+                    onboarding_mode=str(body.get("onboarding_mode", "add_tv")),
+                    replace_tv_id=str(body.get("replace_tv_id", "")),
                 )
                 self._send_json(200, {"ok": True, "prompt": prompt})
+                return
+            if parsed.path == "/api/cloud/seed":
+                if sandbox:
+                    self._send_json(200, {"ok": True, "vault_id": "household", "key_count": 3, "sandbox": True})
+                    return
+                self._send_json(200, CloudBootstrapService.seed_household_vault(store))
+                return
+            if parsed.path == "/api/cloud/link-tv":
+                if sandbox:
+                    rep = str(body.get("replace_tv_id", "")).strip()
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "mode": "replace_tv" if rep else "add_tv",
+                            "message": "Simulated 3-key TV link in Sandbox Mode.",
+                            "sandbox": True,
+                        },
+                    )
+                    return
+                self._send_json(
+                    200,
+                    CloudBootstrapService.link_tv_bootstrap(
+                        store,
+                        tv_ip=str(body.get("tv_ip", "")),
+                        tv_name=str(body.get("tv_name", "")),
+                        tv_room=str(body.get("tv_room", "")),
+                        replace_tv_id=str(body.get("replace_tv_id", "")),
+                    ),
+                )
                 return
             if parsed.path == "/api/browse-folder":
                 self._send_json(200, EnvironmentInspector.browse_folder_dialog())

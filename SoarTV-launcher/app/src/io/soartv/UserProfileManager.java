@@ -287,41 +287,48 @@ public final class UserProfileManager {
     }
 
     /**
+     * Synchronizes the local profile list with Supabase {@code public.user_profiles} synchronously on the caller's thread.
+     */
+    public void syncWithCloudSync() {
+        try {
+            String remoteRaw = SupabaseClient.get(appContext).fetchProfilesRawJsonSync();
+            List<Map<String, Object>> remoteItems = CloudVaultCrypto.JsonCodec.parseJsonObjectArray(remoteRaw);
+            if (!remoteItems.isEmpty()) {
+                synchronized (UserProfileManager.this) {
+                    List<Profile> merged = new ArrayList<>(remoteItems.size());
+                    for (Map<String, Object> item : remoteItems) {
+                        Profile p = Profile.fromJsonMap(item);
+                        if (p != null) merged.add(p);
+                    }
+                    if (!merged.isEmpty()) {
+                        String currentUsername = activeProfile != null ? activeProfile.username : "";
+                        profiles.clear();
+                        profiles.addAll(merged);
+                        Profile match = null;
+                        for (Profile p : profiles) {
+                            if (p.username.equalsIgnoreCase(currentUsername)) {
+                                match = p;
+                                break;
+                            }
+                        }
+                        activeProfile = match != null ? match : profiles.get(0);
+                        saveLocal();
+                    }
+                }
+            }
+        } catch (RuntimeException e) {
+            SupabaseClient.safeLogW("UserProfileManager syncWithCloudSync failed: " + e.getMessage());
+        }
+    }
+
+    /**
      * Synchronizes the local profile list with Supabase {@code public.user_profiles} on a managed background executor.
      *
      * @param onUpdated Optional callback run after sync completes.
      */
     public void syncWithCloudAsync(Runnable onUpdated) {
         PROFILE_SYNC_IO.execute(() -> {
-            try {
-                String remoteRaw = SupabaseClient.get(appContext).fetchProfilesRawJsonSync();
-                List<Map<String, Object>> remoteItems = CloudVaultCrypto.JsonCodec.parseJsonObjectArray(remoteRaw);
-                if (!remoteItems.isEmpty()) {
-                    synchronized (UserProfileManager.this) {
-                        List<Profile> merged = new ArrayList<>(remoteItems.size());
-                        for (Map<String, Object> item : remoteItems) {
-                            Profile p = Profile.fromJsonMap(item);
-                            if (p != null) merged.add(p);
-                        }
-                        if (!merged.isEmpty()) {
-                            String currentUsername = activeProfile != null ? activeProfile.username : "";
-                            profiles.clear();
-                            profiles.addAll(merged);
-                            Profile match = null;
-                            for (Profile p : profiles) {
-                                if (p.username.equalsIgnoreCase(currentUsername)) {
-                                    match = p;
-                                    break;
-                                }
-                            }
-                            activeProfile = match != null ? match : profiles.get(0);
-                            saveLocal();
-                        }
-                    }
-                }
-            } catch (RuntimeException e) {
-                SupabaseClient.safeLogW("UserProfileManager syncWithCloudAsync failed: " + e.getMessage());
-            }
+            syncWithCloudSync();
             if (onUpdated != null) onUpdated.run();
         });
     }
@@ -349,6 +356,10 @@ public final class UserProfileManager {
                 activeProfile = p;
                 saveLocal();
                 Prefs.version++;
+                try {
+                    CloudSyncManager.get(appContext).syncNowAsync("profile_switch", null);
+                } catch (RuntimeException ignored) {
+                }
                 return activeProfile;
             }
         }
@@ -372,6 +383,10 @@ public final class UserProfileManager {
         activeProfile = profiles.get((idx + 1) % profiles.size());
         saveLocal();
         Prefs.version++;
+        try {
+            CloudSyncManager.get(appContext).syncNowAsync("profile_switch", null);
+        } catch (RuntimeException ignored) {
+        }
         return activeProfile;
     }
 

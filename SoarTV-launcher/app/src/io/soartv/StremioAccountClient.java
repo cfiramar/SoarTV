@@ -165,14 +165,51 @@ public final class StremioAccountClient {
         return key != null && !key.isEmpty();
     }
 
+    private static String activeProfileId(Context c) {
+        if (c == null) return "";
+        try {
+            UserProfileManager.Profile p = UserProfileManager.get(c).getActiveProfile();
+            return p != null ? p.id : "";
+        } catch (RuntimeException ignored) {
+            return "";
+        }
+    }
+
+    private static boolean isDefaultProfileActive(Context c) {
+        if (c == null) return true;
+        try {
+            UserProfileManager.Profile p = UserProfileManager.get(c).getActiveProfile();
+            return p == null || p.isDefault;
+        } catch (RuntimeException ignored) {
+            return true;
+        }
+    }
+
     /**
-     * Returns the active Stremio authKey from hardware-backed {@link Secrets}, automatically
-     * migrating any legacy {@code SharedPreferences("stremio_account")} {@code auth_key} entry
-     * into {@link Secrets} and purging it from plaintext XML on first read.
+     * Returns the active profile's Stremio authKey from hardware-backed {@link Secrets}.
+     * Falls back to {@link Secrets#HOUSEHOLD_STREMIO_AUTH_KEY} ONLY when the active profile
+     * explicitly enabled {@link Prefs#useHouseholdStremio()} (opt-in sharing).
      */
     public static String getAuthKey(Context c) {
+        String pid = activeProfileId(c);
+        if (!pid.isEmpty()) {
+            String profKey = Secrets.getProfileSecret(c, pid, "stremio_auth_key");
+            if (!profKey.isEmpty()) {
+                return profKey.trim();
+            }
+            if (Prefs.useHouseholdStremio()) {
+                String hhKey = Secrets.getSecret(c, Secrets.HOUSEHOLD_STREMIO_AUTH_KEY);
+                if (!hhKey.isEmpty()) return hhKey.trim();
+            }
+            if (!isDefaultProfileActive(c)) {
+                return "";
+            }
+        }
         String secretKey = Secrets.getSecret(c, Secrets.STREMIO_AUTH_KEY);
         if (secretKey != null && !secretKey.trim().isEmpty()) {
+            if (!pid.isEmpty() && isDefaultProfileActive(c)) {
+                Secrets.putProfileSecret(c, pid, "stremio_auth_key", secretKey.trim());
+            }
             SharedPreferences sp = prefs(c);
             if (sp != null && (sp.contains("auth_key") || sp.contains("password"))) {
                 sp.edit().remove("auth_key").remove("password").apply();
@@ -185,6 +222,9 @@ public final class StremioAccountClient {
             if (legacy != null && !legacy.trim().isEmpty()) {
                 String clean = legacy.trim();
                 if (Secrets.putSecret(c, Secrets.STREMIO_AUTH_KEY, clean)) {
+                    if (!pid.isEmpty() && isDefaultProfileActive(c)) {
+                        Secrets.putProfileSecret(c, pid, "stremio_auth_key", clean);
+                    }
                     sp.edit().remove("auth_key").remove("password").apply();
                 }
                 return clean;
@@ -201,21 +241,41 @@ public final class StremioAccountClient {
     private static volatile List<LibraryItem> memCachedLibrary = null;
 
     /**
-     * Saves a Stremio authKey encrypted in {@link Secrets} (and optional non-sensitive email in SharedPreferences).
-     * Plaintext passwords are never persisted anywhere.
+     * Saves a Stremio authKey encrypted per active profile in {@link Secrets} (mirroring into
+     * {@link Secrets#STREMIO_AUTH_KEY} and {@link Secrets#HOUSEHOLD_STREMIO_AUTH_KEY} when saving on the default profile).
      */
     public static void saveAuthKey(Context c, String authKey, String email) {
         String cleanKey = authKey != null ? authKey.trim() : "";
-        if (cleanKey.isEmpty()) {
-            Secrets.deleteSecret(c, Secrets.STREMIO_AUTH_KEY);
-        } else {
-            Secrets.putSecret(c, Secrets.STREMIO_AUTH_KEY, cleanKey);
+        String cleanEmail = email != null ? email.trim() : "";
+        String pid = activeProfileId(c);
+        if (!pid.isEmpty()) {
+            Secrets.putProfileSecret(c, pid, "stremio_auth_key", cleanKey);
+            Secrets.putProfileSecret(c, pid, "stremio_email", cleanKey.isEmpty() ? "" : cleanEmail);
+            try {
+                CloudSyncManager.get(c).recordLocalSecretChange(CloudSyncManager.Scope.PROFILE, "stremio_auth_key");
+            } catch (RuntimeException ignored) {
+            }
+        }
+        if (pid.isEmpty() || isDefaultProfileActive(c)) {
+            if (cleanKey.isEmpty()) {
+                Secrets.deleteSecret(c, Secrets.STREMIO_AUTH_KEY);
+            } else {
+                Secrets.putSecret(c, Secrets.STREMIO_AUTH_KEY, cleanKey);
+                Secrets.putSecret(c, Secrets.HOUSEHOLD_STREMIO_AUTH_KEY, cleanKey);
+                if (c != null) {
+                    try {
+                        CloudSyncManager.get(c).recordLocalSecretChange(
+                                CloudSyncManager.Scope.HOUSEHOLD, Secrets.HOUSEHOLD_STREMIO_AUTH_KEY);
+                    } catch (RuntimeException ignored) {
+                    }
+                }
+            }
         }
         SharedPreferences sp = prefs(c);
         if (sp != null) {
             SharedPreferences.Editor ed = sp.edit().remove("auth_key").remove("password");
-            if (email != null && !email.trim().isEmpty() && !cleanKey.isEmpty()) {
-                ed.putString("email", email.trim());
+            if (!cleanEmail.isEmpty() && !cleanKey.isEmpty()) {
+                ed.putString("email", cleanEmail);
             } else if (cleanKey.isEmpty()) {
                 ed.putString("email", "");
                 ed.putString("cached_library_json", "");
@@ -229,9 +289,18 @@ public final class StremioAccountClient {
     }
 
     /**
-     * Returns the saved Stremio account email for display in Settings.
+     * Returns the saved Stremio account email for the active profile for display in Settings.
      */
     public static String getAccountEmail(Context c) {
+        String pid = activeProfileId(c);
+        if (!pid.isEmpty()) {
+            String profEmail = Secrets.getProfileSecret(c, pid, "stremio_email");
+            if (!profEmail.isEmpty()) return profEmail;
+            if (!isDefaultProfileActive(c)) {
+                return Prefs.useHouseholdStremio() && !Secrets.getSecret(c, Secrets.HOUSEHOLD_STREMIO_AUTH_KEY).isEmpty()
+                        ? "Household Shared" : "";
+            }
+        }
         SharedPreferences sp = prefs(c);
         if (sp != null) {
             String saved = sp.getString("email", "");

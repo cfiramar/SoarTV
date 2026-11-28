@@ -36,6 +36,15 @@ public final class CloudVaultCrypto {
     /** Default primary row identifier in {@code public.encrypted_vault}. */
     public static final String DEFAULT_VAULT_ID = "primary";
 
+    /** Household-wide automatic E2EE vault slot identifier. */
+    public static final String HOUSEHOLD_VAULT_ID = "household";
+
+    /** Prefix for per-user profile automatic E2EE vault slots ({@code "profile:<profileUuid>"}). */
+    public static final String PROFILE_VAULT_PREFIX = "profile:";
+
+    /** Domain separation prefix used when deriving the automatic E2EE vault passphrase from {@code household_key}. */
+    public static final String HOUSEHOLD_VAULT_KDF_DOMAIN = "soartv-vault-key-v2:";
+
     /** Canonical algorithm identifier persisted in {@code public.encrypted_vault.kdf_algorithm}. */
     public static final String KDF_ALGORITHM_LABEL = "PBKDF2-HMAC-SHA256";
 
@@ -163,7 +172,7 @@ public final class CloudVaultCrypto {
 
     /**
      * Encrypts a map of secret key/value pairs into an authenticated {@link VaultEnvelope} using
-     * {@code PBKDF2-HMAC-SHA256} (120,000 iterations) and {@code AES-256-GCM}.
+     * {@code PBKDF2-HMAC-SHA256} (120,000 iterations) and {@code AES-256-GCM} under the default {@code "primary"} slot.
      *
      * @param secretsMap       Key-value map of API keys to encrypt (null/empty entries are filtered cleanly; null map rejected).
      * @param masterPassphrase Non-empty user master passphrase characters.
@@ -171,12 +180,27 @@ public final class CloudVaultCrypto {
      * @throws IllegalArgumentException If {@code secretsMap} is null or {@code masterPassphrase} is null/empty.
      */
     public static VaultEnvelope encryptMap(Map<String, String> secretsMap, char[] masterPassphrase) {
+        return encryptMap(DEFAULT_VAULT_ID, secretsMap, masterPassphrase);
+    }
+
+    /**
+     * Encrypts a map of secret key/value pairs into an authenticated {@link VaultEnvelope} for a specific
+     * {@code vaultId} slot (e.g., {@code "household"} or {@code "profile:<uuid>"}).
+     *
+     * @param vaultId          Target vault slot identifier (defaults to {@code "primary"} if blank).
+     * @param secretsMap       Key-value map of secrets to encrypt.
+     * @param masterPassphrase Non-empty passphrase characters (typically derived from {@code household_key}).
+     * @return Authenticated {@link VaultEnvelope} containing zero plaintext key names or values.
+     * @throws IllegalArgumentException If {@code secretsMap} is null or {@code masterPassphrase} is null/empty.
+     */
+    public static VaultEnvelope encryptMap(String vaultId, Map<String, String> secretsMap, char[] masterPassphrase) {
         if (secretsMap == null) {
             throw new IllegalArgumentException("secretsMap must not be null");
         }
         if (masterPassphrase == null || masterPassphrase.length == 0) {
             throw new IllegalArgumentException("masterPassphrase must not be null or empty");
         }
+        String resolvedVaultId = (vaultId == null || vaultId.trim().isEmpty()) ? DEFAULT_VAULT_ID : vaultId.trim();
 
         Map<String, Object> cleanSecrets = new LinkedHashMap<>();
         for (Map.Entry<String, String> entry : secretsMap.entrySet()) {
@@ -202,7 +226,7 @@ public final class CloudVaultCrypto {
             byte[] cipherBytes = cipher.doFinal(plaintextBytes);
 
             return new VaultEnvelope(
-                    DEFAULT_VAULT_ID,
+                    resolvedVaultId,
                     KDF_ALGORITHM_LABEL,
                     Base64.getEncoder().encodeToString(salt),
                     DEFAULT_KDF_ITERATIONS,
@@ -218,6 +242,44 @@ public final class CloudVaultCrypto {
                 Arrays.fill(derivedKeyBytes, (byte) 0);
             }
         }
+    }
+
+    /**
+     * Derives the domain-separated automatic E2EE vault passphrase from the household authorization key so
+     * Java (Android TV), Python (Setup Studio), and ES5 JavaScript (LG webOS / Samsung Tizen) derive identical
+     * vault keys without reusing the raw {@code x-soartv-household-key} HTTP header verbatim as the cipher key.
+     *
+     * @param householdKey Non-empty household key string.
+     * @return Lowercase SHA-256 hex passphrase buffer (caller should scrub with {@link #wipePassphrase}).
+     * @throws IllegalArgumentException If {@code householdKey} is blank.
+     */
+    public static char[] deriveHouseholdVaultPassphrase(String householdKey) {
+        if (householdKey == null || householdKey.trim().isEmpty()) {
+            throw new IllegalArgumentException("householdKey must not be null or empty");
+        }
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest((HOUSEHOLD_VAULT_KDF_DOMAIN + householdKey.trim()).getBytes(StandardCharsets.UTF_8));
+            char[] hex = new char[digest.length * 2];
+            final char[] digits = "0123456789abcdef".toCharArray();
+            for (int i = 0; i < digest.length; i++) {
+                int v = digest[i] & 0xFF;
+                hex[i * 2] = digits[v >>> 4];
+                hex[i * 2 + 1] = digits[v & 0x0F];
+            }
+            Arrays.fill(digest, (byte) 0);
+            return hex;
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
+    }
+
+    /** Builds the canonical per-profile vault slot ID ({@code "profile:<uuid>"}). */
+    public static String profileVaultId(String profileId) {
+        if (profileId == null || profileId.trim().isEmpty()) {
+            throw new IllegalArgumentException("profileId must not be null or empty");
+        }
+        return PROFILE_VAULT_PREFIX + profileId.trim();
     }
 
     /**
@@ -360,6 +422,45 @@ public final class CloudVaultCrypto {
                 }
             }
             return fallback;
+        }
+
+        static long optLong(Map<String, Object> map, String key, long fallback) {
+            if (map == null || key == null || !map.containsKey(key)) return fallback;
+            Object v = map.get(key);
+            if (v instanceof Number) return ((Number) v).longValue();
+            if (v instanceof String) {
+                try {
+                    return Long.parseLong(((String) v).trim());
+                } catch (NumberFormatException ignored) {
+                    return fallback;
+                }
+            }
+            return fallback;
+        }
+
+        @SuppressWarnings("unchecked")
+        static Map<String, Object> optObjectMap(Map<String, Object> map, String key) {
+            if (map == null || key == null) return Collections.emptyMap();
+            Object v = map.get(key);
+            if (v instanceof Map) {
+                return (Map<String, Object>) v;
+            }
+            return Collections.emptyMap();
+        }
+
+        static List<String> optStringList(Map<String, Object> map, String key) {
+            if (map == null || key == null) return Collections.emptyList();
+            Object v = map.get(key);
+            if (!(v instanceof List)) return Collections.emptyList();
+            List<?> raw = (List<?>) v;
+            List<String> out = new ArrayList<>(raw.size());
+            for (Object item : raw) {
+                if (item != null) {
+                    String s = String.valueOf(item).trim();
+                    if (!s.isEmpty()) out.add(s);
+                }
+            }
+            return out;
         }
 
         static boolean optBoolean(Map<String, Object> map, String key, boolean fallback) {

@@ -59,11 +59,14 @@ public class Secrets extends ContentProvider {
     private static final SecureRandom RNG = new SecureRandom();
 
     static final String ADB_KEY = "adb_key";
+    public static final String SUPABASE_URL = "supabase_url";
+    public static final String SUPABASE_ANON_KEY = "supabase_anon_key";
     public static final String SENSIBO_API_KEY = "sensibo_api_key";
     public static final String TUYA_ACCESS_ID = "tuya_access_id";
     public static final String TUYA_ACCESS_SECRET = "tuya_access_secret";
     public static final String GITHUB_TOKEN = "github_token";
     public static final String STREMIO_AUTH_KEY = "stremio_auth_key";
+    public static final String HOUSEHOLD_STREMIO_AUTH_KEY = "household_stremio_auth_key";
     public static final String HOUSEHOLD_KEY = "household_key";
     public static final String GAMING_PC_TOKEN = "gaming_pc_token";
     public static final String TMDB_KEY = "tmdb_key";
@@ -73,14 +76,50 @@ public class Secrets extends ContentProvider {
     public static final String ADMIN_EMAILS = "admin_emails";
     public static final String REMOTE_PAIRED_DEVICES = "remote_paired_devices";
     public static final String TRAKT_CLIENT_ID = "trakt_client_id";
+    public static final String SWITCHER_API_KEY = "switcher_api_key";
+    public static final String TV_BOOTSTRAP_DEVICE_ID = "tv_bootstrap_device_id";
+    public static final String TV_BOOTSTRAP_NAME = "tv_bootstrap_name";
+    public static final String TV_BOOTSTRAP_ROOM = "tv_bootstrap_room";
+    public static final String TV_BOOTSTRAP_REPLACE_ID = "tv_bootstrap_replace_id";
+
+    /** Household-shared secret names synchronized via {@code encrypted_vault['household']}. */
+    static final List<String> HOUSEHOLD_VAULT_KEYS = Collections.unmodifiableList(Arrays.asList(
+            SENSIBO_API_KEY,
+            TUYA_ACCESS_ID,
+            TUYA_ACCESS_SECRET,
+            GITHUB_TOKEN,
+            HOUSEHOLD_STREMIO_AUTH_KEY,
+            GAMING_PC_TOKEN,
+            TMDB_KEY,
+            OMDB_KEY,
+            MDBLIST_KEY,
+            GEMINI_API_KEY,
+            ADMIN_EMAILS,
+            REMOTE_PAIRED_DEVICES,
+            TRAKT_CLIENT_ID,
+            SWITCHER_API_KEY
+    ));
+
+    /** Per-profile secret keys synchronized via {@code encrypted_vault['profile:<uuid>']}. */
+    static final List<String> PROFILE_VAULT_KEYS = Collections.unmodifiableList(Arrays.asList(
+            "trakt_access",
+            "trakt_refresh",
+            "trakt_expires",
+            "trakt_user",
+            "stremio_auth_key",
+            "stremio_email"
+    ));
 
     static final List<String> NAMES = Collections.unmodifiableList(Arrays.asList(
             ADB_KEY,
+            SUPABASE_URL,
+            SUPABASE_ANON_KEY,
             SENSIBO_API_KEY,
             TUYA_ACCESS_ID,
             TUYA_ACCESS_SECRET,
             GITHUB_TOKEN,
             STREMIO_AUTH_KEY,
+            HOUSEHOLD_STREMIO_AUTH_KEY,
             HOUSEHOLD_KEY,
             GAMING_PC_TOKEN,
             TMDB_KEY,
@@ -91,9 +130,13 @@ public class Secrets extends ContentProvider {
             REMOTE_PAIRED_DEVICES,
             TRAKT_CLIENT_ID,
             "wiz_light_ips",
-            "switcher_api_key",
+            SWITCHER_API_KEY,
             "enable_gaming",
-            "enable_smarthome"
+            "enable_smarthome",
+            TV_BOOTSTRAP_DEVICE_ID,
+            TV_BOOTSTRAP_NAME,
+            TV_BOOTSTRAP_ROOM,
+            TV_BOOTSTRAP_REPLACE_ID
     ));
 
     /** Optional directory override used strictly by headless Desktop JVM unit tests when Context is null/stub. */
@@ -173,7 +216,93 @@ public class Secrets extends ContentProvider {
     }
 
     private static boolean isValidSecretName(String name) {
-        return name != null && !name.isEmpty() && name.matches("[a-zA-Z0-9_.-]{1,64}") && !name.contains("..");
+        return name != null && !name.isEmpty() && name.matches("[a-zA-Z0-9_.-]{1,96}") && !name.contains("..");
+    }
+
+    /** Builds a filesystem-safe per-profile secret name ({@code "prof_<safeId>_<key>"}). */
+    public static String profileSecretName(String profileId, String key) {
+        if (profileId == null || key == null) return "";
+        String safeId = profileId.trim().replaceAll("[^a-zA-Z0-9_-]", "");
+        String safeKey = key.trim().replaceAll("[^a-zA-Z0-9_.-]", "");
+        if (safeId.isEmpty() || safeKey.isEmpty()) return "";
+        if (safeId.length() > 40) safeId = safeId.substring(0, 40);
+        return "prof_" + safeId + "_" + safeKey;
+    }
+
+    /** Reads a hardware-encrypted per-profile secret, or {@code ""} if unset. */
+    public static String getProfileSecret(Context c, String profileId, String key) {
+        String name = profileSecretName(profileId, key);
+        return name.isEmpty() ? "" : getSecret(c, name);
+    }
+
+    /** Encrypts and persists a per-profile secret at rest (or deletes it when empty). */
+    public static boolean putProfileSecret(Context c, String profileId, String key, String value) {
+        String name = profileSecretName(profileId, key);
+        return !name.isEmpty() && putSecret(c, name, value);
+    }
+
+    /** Exports household-shared secrets (excluding device-local ADB/bootstrap keys and household_key itself). */
+    public static Map<String, String> exportHouseholdVaultSecrets(Context c) {
+        File dir = resolveSecretsDir(c);
+        Map<String, String> out = new LinkedHashMap<>();
+        if (dir == null) return out;
+        synchronized (LOCK) {
+            for (String key : HOUSEHOLD_VAULT_KEYS) {
+                String val = getSecretFromDir(dir, key);
+                if (val != null && !val.isEmpty()) {
+                    out.put(key, val);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Imports household-shared secrets into hardware-encrypted storage. */
+    public static void importHouseholdVaultSecrets(Context c, Map<String, String> map) {
+        File dir = resolveSecretsDir(c);
+        if (dir == null || map == null || map.isEmpty()) return;
+        synchronized (LOCK) {
+            for (String key : HOUSEHOLD_VAULT_KEYS) {
+                if (!map.containsKey(key)) continue;
+                String val = map.get(key);
+                if (val != null && !val.isEmpty()) {
+                    putSecretToDir(dir, key, val);
+                }
+            }
+        }
+    }
+
+    /** Exports per-profile secrets (Trakt OAuth tokens + Stremio authKey/email) for {@code profileId}. */
+    public static Map<String, String> exportProfileVaultSecrets(Context c, String profileId) {
+        File dir = resolveSecretsDir(c);
+        Map<String, String> out = new LinkedHashMap<>();
+        if (dir == null || profileId == null || profileId.trim().isEmpty()) return out;
+        synchronized (LOCK) {
+            for (String key : PROFILE_VAULT_KEYS) {
+                String full = profileSecretName(profileId, key);
+                String val = getSecretFromDir(dir, full);
+                if (val != null && !val.isEmpty()) {
+                    out.put(key, val);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Imports per-profile secrets (Trakt OAuth tokens + Stremio authKey/email) for {@code profileId}. */
+    public static void importProfileVaultSecrets(Context c, String profileId, Map<String, String> map) {
+        File dir = resolveSecretsDir(c);
+        if (dir == null || profileId == null || profileId.trim().isEmpty() || map == null || map.isEmpty()) return;
+        synchronized (LOCK) {
+            for (String key : PROFILE_VAULT_KEYS) {
+                if (!map.containsKey(key)) continue;
+                String val = map.get(key);
+                String full = profileSecretName(profileId, key);
+                if (val != null && !val.isEmpty()) {
+                    putSecretToDir(dir, full, val);
+                }
+            }
+        }
     }
 
     private static File resolveSecretsDir(Context c) {

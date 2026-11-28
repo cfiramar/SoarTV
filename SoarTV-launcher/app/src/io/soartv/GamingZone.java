@@ -2536,7 +2536,116 @@ public final class GamingZone {
         }
 
         String discovered = discoverLaptopIpOnLanSync(context);
-        return !discovered.isEmpty() ? discovered : currentIp;
+        if (!discovered.isEmpty()) {
+            reportGamingHostToCloudAsync(context, discovered);
+            return discovered;
+        }
+        // Cloud Rendezvous fallback (survives cross-subnet moves & UDP-blocking mesh routers)
+        String cloudIp = resolveCloudGamingHostIpSync(context, currentIp);
+        if (!cloudIp.isEmpty()) {
+            setLaptopIp(context, cloudIp);
+            return cloudIp;
+        }
+        return currentIp;
+    }
+
+    /**
+     * Queries {@code public.gaming_hosts} in Supabase for a paired Gaming PC's latest LAN IP & MACs
+     * when local UDP/subnet discovery did not find it (e.g. mesh AP isolation or cross-subnet change).
+     */
+    static String resolveCloudGamingHostIpSync(Context context, String skipIp) {
+        if (context == null) return "";
+        try {
+            SupabaseClient sb = SupabaseClient.get(context);
+            List<SupabaseClient.GamingHostRecord> hosts = sb.isConfigured()
+                    ? sb.fetchGamingHostsSync()
+                    : sb.getCachedGamingHosts();
+            if (hosts == null || hosts.isEmpty()) return "";
+            adoptCloudGamingHosts(context, hosts);
+            for (SupabaseClient.GamingHostRecord h : hosts) {
+                String ip = h.lanIp == null ? "" : h.lanIp.trim();
+                if (ip.isEmpty() || ip.equals(skipIp)) continue;
+                if (!SunshineStreamClient.isAllowedCleartextLanHost(ip)) continue;
+                if (verifyCandidateGamingPcEndpoint(context, ip, h.agentPort, 900)) {
+                    return ip;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return "";
+    }
+
+    /**
+     * Adopts Gaming PC MAC addresses, Sunshine UUID, and last-seen LAN IP from Supabase {@code gaming_hosts}
+     * so a new or second TV can immediately wake and pair with the PC without manual IP entry.
+     */
+    public static void adoptCloudGamingHosts(Context context, List<SupabaseClient.GamingHostRecord> hosts) {
+        if (context == null || hosts == null || hosts.isEmpty()) return;
+        SupabaseClient.GamingHostRecord primary = hosts.get(0);
+        SharedPreferences sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        SharedPreferences.Editor ed = sp.edit();
+        if (primary.lanIp != null && !primary.lanIp.trim().isEmpty()
+                && SunshineStreamClient.isAllowedCleartextLanHost(primary.lanIp.trim())) {
+            String cur = sp.getString(KEY_LAPTOP_IP, "").trim();
+            if (cur.isEmpty()) {
+                ed.putString(KEY_LAPTOP_IP, primary.lanIp.trim());
+            }
+        }
+        if (primary.sunshineUuid != null && !primary.sunshineUuid.trim().isEmpty()) {
+            ed.putString(KEY_CACHED_SUNSHINE_UUID, primary.sunshineUuid.trim());
+        }
+        if (primary.hostname != null && !primary.hostname.trim().isEmpty()) {
+            ed.putString(KEY_CACHED_SUNSHINE_HOST, primary.hostname.trim());
+        }
+        if (primary.macAddresses != null && !primary.macAddresses.isEmpty()) {
+            Set<String> mergedMacs = new java.util.LinkedHashSet<>();
+            String existing = sp.getString(KEY_CACHED_PC_MACS, "");
+            if (existing != null && !existing.isEmpty()) {
+                for (String m : existing.split(",")) {
+                    String clean = m.trim();
+                    if (!clean.isEmpty()) mergedMacs.add(clean);
+                }
+            }
+            for (String m : primary.macAddresses) {
+                if (m != null && !m.trim().isEmpty()) mergedMacs.add(m.trim().toUpperCase(java.util.Locale.US));
+            }
+            ed.putString(KEY_CACHED_PC_MACS, String.join(",", mergedMacs));
+        }
+        ed.apply();
+    }
+
+    /** Reports a verified Gaming PC's fresh LAN IP, MACs, and Sunshine UUID to {@code public.gaming_hosts}. */
+    static void reportGamingHostToCloudAsync(Context context, String lanIp) {
+        if (context == null || lanIp == null || lanIp.trim().isEmpty()) return;
+        final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        final String cleanIp = lanIp.trim();
+        GAMING_RPC_IO.execute(() -> {
+            try {
+                SupabaseClient sb = SupabaseClient.get(appCtx);
+                if (!sb.isConfigured()) return;
+                SharedPreferences sp = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                String uuid = sp.getString(KEY_CACHED_SUNSHINE_UUID, "").trim();
+                String hostname = sp.getString(KEY_CACHED_SUNSHINE_HOST, "").trim();
+                String hostId = !uuid.isEmpty() ? uuid : (!hostname.isEmpty() ? hostname.toLowerCase(java.util.Locale.ROOT) : "primary-pc");
+                List<String> macs = new ArrayList<>();
+                String rawMacs = sp.getString(KEY_CACHED_PC_MACS, "");
+                if (rawMacs != null && !rawMacs.isEmpty()) {
+                    for (String m : rawMacs.split(",")) {
+                        if (!m.trim().isEmpty()) macs.add(m.trim());
+                    }
+                }
+                java.util.Map<String, Object> payload = new java.util.LinkedHashMap<>();
+                payload.put("host_id", hostId);
+                payload.put("hostname", hostname.isEmpty() ? hostId : hostname);
+                payload.put("lan_ip", cleanIp);
+                payload.put("agent_port", LAPTOP_AGENT_PORT);
+                payload.put("mac_addresses", macs);
+                payload.put("sunshine_uuid", uuid);
+                payload.put("last_seen_at", SupabaseClient.isoNowUtc());
+                sb.upsertGamingHostSync(payload);
+            } catch (Exception ignored) {
+            }
+        });
     }
 
     /**
@@ -2692,6 +2801,24 @@ public final class GamingZone {
         return out;
     }
 
+    /** Alias returning temporarily hidden game IDs for {@link CloudSyncManager}. */
+    public static Set<String> getTemporarilyHiddenGameIds(Context context) {
+        return getHiddenGameIds(context);
+    }
+
+    /** Replaces local hidden & permanently hidden game IDs from active profile Cloud Sync. */
+    public static void importHiddenGameIdsFromCloud(Context context, Set<String> tempHidden, Set<String> permHidden) {
+        if (context == null) return;
+        Set<String> perm = permHidden == null ? new HashSet<>() : new HashSet<>(permHidden);
+        Set<String> temp = tempHidden == null ? new HashSet<>() : new HashSet<>(tempHidden);
+        temp.removeAll(perm);
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putStringSet(KEY_PERM_HIDDEN_IDS, perm)
+                .putStringSet(KEY_HIDDEN_IDS, temp)
+                .apply();
+    }
+
     /** Returns the set of permanently hidden game IDs (cannot be undone, never shown under the Hidden tile). */
     public static Set<String> getPermanentlyHiddenGameIds(Context context) {
         if (context == null) return Collections.emptySet();
@@ -2713,6 +2840,10 @@ public final class GamingZone {
                 .putStringSet(KEY_PERM_HIDDEN_IDS, perm)
                 .putStringSet(KEY_HIDDEN_IDS, temp)
                 .apply();
+        try {
+            CloudSyncManager.get(context).recordLocalFieldChange(CloudSyncManager.Scope.PROFILE, "perm_hidden_games");
+        } catch (RuntimeException ignored) {
+        }
     }
 
     /** Returns the list of temporarily hidden games (never includes permanently hidden games). */
@@ -2756,6 +2887,10 @@ public final class GamingZone {
             }
         }
         editor.apply();
+        try {
+            CloudSyncManager.get(context).recordLocalFieldChange(CloudSyncManager.Scope.PROFILE, "hidden_games");
+        } catch (RuntimeException ignored) {
+        }
 
         final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         GAMING_RPC_IO.execute(() -> {

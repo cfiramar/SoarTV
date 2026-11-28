@@ -36,6 +36,9 @@ import java.util.TimeZone;
  */
 public final class SettingsTree {
 
+    /** Total number of core onboarding steps tracked by Initial Setup &amp; Cloud. */
+    private static final int INITIAL_SETUP_TOTAL_STEPS = 6;
+
     private SettingsTree() {}
 
     /** Visual &amp; interaction affordance rendered for each Settings row. */
@@ -354,6 +357,16 @@ public final class SettingsTree {
         public String powerOnMode = "";
         public String recentsMode = "off";
         public boolean allowDoubleHomeRecents = true;
+
+        // Cloud Sync v2 & Per-TV Override state
+        public boolean cloudSyncConfigured = false;
+        public String cloudSyncStatus = "Not synced yet";
+        public long cloudLastSyncAt = 0L;
+        public List<SupabaseClient.TvDeviceRecord> householdTvDevices = new ArrayList<>();
+        public boolean useHouseholdStremio = false;
+        public boolean tvOverrideShelf = false;
+        public boolean tvOverrideHiddenApps = false;
+        public boolean tvOverrideScreensaver = false;
     }
 
     /**
@@ -401,6 +414,11 @@ public final class SettingsTree {
                     && (!Secrets.get(c, "tuya_access_secret").isEmpty() || !Config.TUYA_ACCESS_SECRET.trim().isEmpty());
             s.knownControllers = ControllerManager.getAllKnownControllers(c);
             s.pairedRemotes = RemoteAuthManager.get(c).listDevices();
+            CloudSyncManager.SyncSummary cloudSum = CloudSyncManager.get(c).getSummary();
+            s.cloudSyncConfigured = cloudSum.configured;
+            s.cloudSyncStatus = cloudSum.statusText;
+            s.cloudLastSyncAt = cloudSum.lastSyncAtMs;
+            s.householdTvDevices = SupabaseClient.get(c).getCachedActiveTvDevices();
             s.gamingPcIp = safeString(GamingZone.getLaptopIp(c));
             GamingZone.LaptopStatus cachedPc = GamingZone.getCachedLaptopStatus(c);
             if (cachedPc != null) {
@@ -466,6 +484,10 @@ public final class SettingsTree {
         s.powerOnMode = Prefs.powerOn();
         s.recentsMode = Prefs.recents();
         s.allowDoubleHomeRecents = !RemoteKeys.XIAOMI;
+        s.useHouseholdStremio = Prefs.useHouseholdStremio();
+        s.tvOverrideShelf = Prefs.isTvOverrideShelfEnabled();
+        s.tvOverrideHiddenApps = Prefs.isTvOverrideHiddenAppsEnabled();
+        s.tvOverrideScreensaver = Prefs.isTvOverrideScreensaverEnabled();
         try {
             String[] langs = Ui.languages();
             if (langs != null) {
@@ -644,16 +666,17 @@ public final class SettingsTree {
     /**
      * Builds the complete redesigned Two-Panel Settings tree from a state snapshot.
      *
-     * <p>Follows Native Google TV ordering across 3 clear sections (10 compact categories that fit
-     * simultaneously on screen with zero root scrolling), promoting Initial Setup to the top only
-     * while setup is incomplete and keeping it accessible under {@code System} once completed.
+     * <p>Follows Native Google TV ordering across 3 clear sections, promoting Initial Setup to the
+     * top only while setup is incomplete and moving it to the bottom of the Settings rail once
+     * completed.
      */
     public static Node buildRoot(StateSnapshot s) {
         StateSnapshot snap = (s != null) ? s : new StateSnapshot();
         List<Node> rootList = new ArrayList<>();
+        boolean initialSetupCompleted = isInitialSetupCompleted(snap);
 
-        // Promote Initial Setup only while incomplete so daily Settings starts immediately on TV controls
-        if (!snap.initialSetupDone) {
+        // Promote Initial Setup to the top only while incomplete; once completed, move it to the bottom
+        if (!initialSetupCompleted) {
             rootList.add(sectionHeader("sec_setup", "GET STARTED"));
             rootList.add(buildInitialSetupNode(snap));
         }
@@ -679,7 +702,10 @@ public final class SettingsTree {
         rootList.add(sectionHeader("sec_system", "ACCOUNTS & SYSTEM"));
         rootList.add(buildUsersNode(snap));
         rootList.add(buildAppsPrivacyNode(snap));
-        rootList.add(buildSystemNode(snap, snap.initialSetupDone));
+        rootList.add(buildSystemNode(snap));
+        if (initialSetupCompleted) {
+            rootList.add(buildInitialSetupNode(snap));
+        }
 
         return new Node("root", "Settings", "", "", "settings", false, false,
                 "", 0, RowType.GROUP, StatusTone.NONE, rootList);
@@ -1147,6 +1173,18 @@ public final class SettingsTree {
                                 s.statusIcons ? "On" : "Off",
                                 "wifi",
                                 s.statusIcons),
+                        toggleNode("tv_override_shelf",
+                                "Custom Favorite Apps Shelf for This TV",
+                                "Use a separate Favorite Apps list on this TV instead of syncing with your user profile",
+                                s.tvOverrideShelf ? "This TV Only" : "Synced with Profile",
+                                "apps",
+                                s.tvOverrideShelf),
+                        toggleNode("tv_override_hidden_apps",
+                                "Custom Hidden Apps for This TV",
+                                "Hide or unhide apps specifically on this TV instead of syncing with your user profile",
+                                s.tvOverrideHiddenApps ? "This TV Only" : "Synced with Profile",
+                                "eye_off",
+                                s.tvOverrideHiddenApps),
                         groupNode("ui_clock_fmt",
                                 "Clock Format",
                                 "Choose Automatic, 24-Hour, or 12-Hour clock across SoarTV",
@@ -1633,6 +1671,16 @@ public final class SettingsTree {
 
         Node traktNode = buildTraktAccountNode(s, "Trakt Account (OAuth)");
         Node stremioNode = buildStremioAccountNode(s, "Stremio Account (Library Sync)");
+        Node stremioSharedNode = toggleNode(
+                "stremio_use_household",
+                "Use Household Shared Stremio",
+                "Opt in to share the household Stremio account when this profile has no personal Stremio login",
+                s.useHouseholdStremio ? "Shared" : "Personal",
+                "play",
+                s.useHouseholdStremio);
+
+        Node cloudSyncNode = buildCloudSyncActionNode(s, "cloud_sync_now", "Cloud Settings & Encrypted Vault Sync");
+        Node cloudTvsNode = buildHouseholdTvsNode(s, "cloud_tv_devices", "Household TVs in Cloud");
 
         String lastSyncLabel = formatSyncTimestamp(s.lastAccountSyncAt);
         String syncSub = (s.traktConnected || s.stremioConnected)
@@ -1669,13 +1717,85 @@ public final class SettingsTree {
         return groupNode(
                 "users",
                 "Accounts & Profiles",
-                "Household profiles, Trakt & Stremio accounts, Sync & Google TV sign-in",
+                "Household profiles, Cloud Sync, Trakt & Stremio accounts & Google TV sign-in",
                 s.activeProfileName,
                 "user",
                 false,
                 "",
                 StatusTone.NONE,
-                Arrays.asList(profileNode, traktNode, stremioNode, syncAllNode, googleAccounts));
+                Arrays.asList(profileNode, cloudSyncNode, cloudTvsNode, traktNode, stremioNode, stremioSharedNode, syncAllNode, googleAccounts));
+    }
+
+    private static Node buildCloudSyncActionNode(StateSnapshot s, String id, String title) {
+        String lastLabel = formatSyncTimestamp(s.cloudLastSyncAt);
+        String val = !s.cloudSyncConfigured
+                ? "Not Linked"
+                : (s.cloudLastSyncAt > 0L ? lastLabel : "Ready");
+        String statusPrefix = (s.cloudSyncStatus != null && !s.cloudSyncStatus.isEmpty())
+                ? (s.cloudSyncStatus + " · ")
+                : "";
+        String sub = s.cloudSyncConfigured
+                ? (statusPrefix + "Automatic zero-knowledge AES-256-GCM vault & 3-tier cloud sync")
+                : "Link this TV with Setup Studio (Supabase URL, Anon Key & Household Key)";
+        return actionNode(
+                id,
+                title,
+                sub,
+                val,
+                "cloud",
+                s.cloudSyncConfigured,
+                s.cloudSyncConfigured ? StatusTone.POSITIVE : StatusTone.NONE);
+    }
+
+    private static Node buildHouseholdTvsNode(StateSnapshot s, String id, String title) {
+        List<SupabaseClient.TvDeviceRecord> tvs = s.householdTvDevices != null
+                ? s.householdTvDevices
+                : Collections.emptyList();
+        List<Node> children = new ArrayList<>();
+        if (tvs.isEmpty()) {
+            children.add(infoNode(
+                    id + "_empty",
+                    "No Household TVs Synced Yet",
+                    "Run Cloud Sync to register this TV and discover other TVs in your household",
+                    "",
+                    "tv"));
+        } else {
+            for (int i = 0; i < tvs.size(); i++) {
+                SupabaseClient.TvDeviceRecord tv = tvs.get(i);
+                if (tv == null) continue;
+                String label = tv.deviceName.isEmpty() ? tv.deviceId : tv.deviceName;
+                StringBuilder meta = new StringBuilder();
+                if (!tv.roomName.isEmpty()) meta.append(tv.roomName);
+                if (!tv.platform.isEmpty()) {
+                    if (meta.length() > 0) meta.append(" · ");
+                    meta.append(tv.platform);
+                }
+                if (!tv.brand.isEmpty()) {
+                    if (meta.length() > 0) meta.append(" · ");
+                    meta.append(tv.brand);
+                }
+                String ipLabel = tv.lanIp.isEmpty() ? "Cloud" : tv.lanIp;
+                children.add(infoNode(
+                        id + "_item_" + i,
+                        label,
+                        meta.length() == 0 ? tv.deviceId : meta.toString(),
+                        ipLabel,
+                        "tv"));
+            }
+        }
+        String countVal = tvs.isEmpty()
+                ? (s.cloudSyncConfigured ? "0 TVs" : "Offline")
+                : (tvs.size() == 1 ? "1 TV" : (tvs.size() + " TVs"));
+        return groupNode(
+                id,
+                title,
+                "Active TVs linked to your household cloud directory (auto-updates on IP changes)",
+                countVal,
+                "tv",
+                !tvs.isEmpty(),
+                "Press OK to view TVs registered in your household",
+                !tvs.isEmpty() ? StatusTone.POSITIVE : StatusTone.NONE,
+                children);
     }
 
     private static Node buildAppsPrivacyNode(StateSnapshot s) {
@@ -1750,7 +1870,7 @@ public final class SettingsTree {
                                 usageAdsChildren)));
     }
 
-    private static Node buildSystemNode(StateSnapshot s, boolean includeInitialSetupInsideSystem) {
+    private static Node buildSystemNode(StateSnapshot s) {
         // 1. About & Device Info (100% live device telemetry)
         String modelLabel = (s.deviceModel != null && !s.deviceModel.isEmpty()) ? s.deviceModel : "Android TV";
         String androidLabel = "Android " + ((s.androidVersion != null && !s.androidVersion.isEmpty()) ? s.androidVersion : "TV");
@@ -2004,9 +2124,6 @@ public final class SettingsTree {
         List<Node> sysChildren = new ArrayList<>();
         sysChildren.add(aboutNode);
         sysChildren.add(launcherUpdatesNode);
-        if (includeInitialSetupInsideSystem) {
-            sysChildren.add(buildInitialSetupNode(s));
-        }
         sysChildren.add(notifNode);
         sysChildren.add(powerNode);
         sysChildren.add(dateTimeNode);
@@ -2035,7 +2152,7 @@ public final class SettingsTree {
         return groupNode(
                 "system_settings",
                 "System",
-                "About, Updates, Setup & Vault, Power & Sleep Timer, Language, Storage",
+                "About, Updates, Power & Sleep Timer, Language, Storage",
                 sysBadge,
                 "settings",
                 false,
@@ -2046,18 +2163,36 @@ public final class SettingsTree {
 
     // MARK: - Shared Reusable Sub-Trees (Initial Setup Guide, Accounts, Controllers, Theme, Genres, Screensaver)
 
-    private static Node buildInitialSetupNode(StateSnapshot s) {
-        int activeRemotes = countActivePairedRemotes(s);
+    /**
+     * Counts how many of the core onboarding steps in Initial Setup &amp; Cloud are currently completed.
+     */
+    static int countCompletedInitialSetupSteps(StateSnapshot s) {
+        if (s == null) return 0;
         int completedSteps = 0;
-        if (activeRemotes > 0) completedSteps++;
+        if (countActivePairedRemotes(s) > 0) completedSteps++;
         if (s.traktConnected) completedSteps++;
         if (s.stremioConnected) completedSteps++;
         if (s.tvRoom != null && !s.tvRoom.isEmpty()) completedSteps++;
         if (s.hasSensiboKey || s.hasTuyaKeys || s.discoveredWizBulbs > 0) completedSteps++;
         if (s.hasTmdbKey) completedSteps++;
+        return completedSteps;
+    }
 
-        boolean allDone = completedSteps >= 6 || s.initialSetupDone;
-        String overallStatus = allDone ? "Completed" : (completedSteps + " / 6 Steps");
+    /**
+     * Returns {@code true} when Initial Setup &amp; Cloud is completed (either explicitly marked done
+     * or all core onboarding steps are configured), which moves the row to the bottom of Settings.
+     */
+    public static boolean isInitialSetupCompleted(StateSnapshot s) {
+        if (s == null) return false;
+        return s.initialSetupDone || countCompletedInitialSetupSteps(s) >= INITIAL_SETUP_TOTAL_STEPS;
+    }
+
+    private static Node buildInitialSetupNode(StateSnapshot s) {
+        int activeRemotes = countActivePairedRemotes(s);
+        int completedSteps = countCompletedInitialSetupSteps(s);
+
+        boolean allDone = isInitialSetupCompleted(s);
+        String overallStatus = allDone ? "Completed" : (completedSteps + " / " + INITIAL_SETUP_TOTAL_STEPS + " Steps");
         StatusTone tone = allDone ? StatusTone.POSITIVE : StatusTone.WARNING;
 
         Node wizardStartNode = actionNode(
@@ -2157,25 +2292,13 @@ public final class SettingsTree {
                         s.hasGeminiKey ? StatusTone.POSITIVE : StatusTone.NONE),
                 actionNode("setup_key_supabase",
                         "Supabase Cloud Database (URL & Anon Key)",
-                        "Private free-tier Supabase project for multi-device profiles, votes & Reels",
+                        "Private free-tier Supabase project for multi-device profiles, settings & auto-vault",
                         s.hasSupabase ? "Completed" : "Not Configured",
                         "cloud",
                         s.hasSupabase,
                         s.hasSupabase ? StatusTone.POSITIVE : StatusTone.NONE),
-                actionNode("vault_backup",
-                        "Backup Keys to Encrypted Cloud Vault",
-                        "Zero-knowledge AES-256-GCM backup of your private keys to Supabase",
-                        s.hasSupabase ? "Ready" : "Requires Supabase",
-                        "cloud",
-                        false,
-                        StatusTone.NONE),
-                actionNode("vault_restore",
-                        "Restore Keys from Encrypted Cloud Vault",
-                        "Decrypt and restore your private keys from Supabase Cloud Vault",
-                        s.hasSupabase ? "Restore" : "Offline Cache",
-                        "sync",
-                        false,
-                        StatusTone.NONE));
+                buildCloudSyncActionNode(s, "setup_cloud_sync_now", "Sync Cloud Settings & Encrypted Vault Now"),
+                buildHouseholdTvsNode(s, "setup_cloud_tv_devices", "Household TVs Linked to Cloud"));
 
         Node keysNode = groupNode(
                 "setup_keys",
@@ -2191,11 +2314,11 @@ public final class SettingsTree {
         Node finishNode = actionNode(
                 "setup_mark_done",
                 "Mark Initial Setup as Complete",
-                "Move Initial Setup into System once your accounts and keys are ready",
-                s.initialSetupDone ? "Completed" : "Finish",
+                "Move Initial Setup to the bottom of Settings once your accounts and keys are ready",
+                allDone ? "Completed" : "Finish",
                 "check",
-                s.initialSetupDone,
-                s.initialSetupDone ? StatusTone.POSITIVE : StatusTone.NONE);
+                allDone,
+                allDone ? StatusTone.POSITIVE : StatusTone.NONE);
 
         return groupNode(
                 "initial_setup",
@@ -2759,15 +2882,9 @@ public final class SettingsTree {
                     sel ? "Selected" : "", iconForClockStyle(st), sel));
         }
 
-        List<Node> intervalNodes = new ArrayList<>();
-        for (int i = 0; i < Prefs.SAVER_INTERVALS_MS.length; i++) {
-            long ms = Prefs.SAVER_INTERVALS_MS[i];
-            String label = Prefs.SAVER_INTERVAL_LABELS[i];
-            boolean sel = ms == s.saverIntervalMs;
-            intervalNodes.add(checkNode("ss_interval:" + ms, label,
-                    "Display each slide for " + label + " before transition",
-                    sel ? "Selected" : "", "timer", sel));
-        }
+        String intervalVal = (s.saverIntervalLabel != null && !s.saverIntervalLabel.isEmpty())
+                ? s.saverIntervalLabel
+                : Prefs.formatSaverIntervalLabel(s.saverIntervalMs);
 
         // Exact 6 granular overlay toggles (distinctly named so Location Caption != System Location Access)
         List<Node> infoNodes = Arrays.asList(
@@ -2828,6 +2945,9 @@ public final class SettingsTree {
                 Arrays.asList(
                         actionNode("ss_preview", "Start Screensaver",
                                 "Launch the rotating 4K UHD photography screensaver now", "4K UHD", "tv", false, StatusTone.NONE),
+                        toggleNode("tv_override_screensaver", "Custom Screensaver for This TV",
+                                "Keep separate screensaver galleries & clock settings only on this TV",
+                                s.tvOverrideScreensaver ? "This TV Only" : "Synced with Profile", "tv", s.tvOverrideScreensaver),
                         groupNode("ss_category", "Photography Category",
                                 "Choose 4K UHD (3840×2160) photography galleries (live preview on right)",
                                 catSummary, catParentIcon, false,
@@ -2839,10 +2959,9 @@ public final class SettingsTree {
                         toggleNode("ss_animation", "Image Animations",
                                 "Toggle Ken Burns pan & zoom motion",
                                 s.saverAnimation ? "Enabled" : "Disabled", "sparkles", s.saverAnimation),
-                        groupNode("ss_interval", "Slide Duration",
-                                "Choose duration between image transitions",
-                                s.saverIntervalLabel, "timer", false,
-                                "Press OK to select slide duration", StatusTone.NONE, intervalNodes),
+                        actionNode("ss_interval", "Slide Duration",
+                                "Open Up/Down duration stepper (Don't change image through 2h)",
+                                intervalVal, "timer", false, StatusTone.NONE),
                         groupNode("ss_info_toggles", "On-Screen Info & Text",
                                 "Customize visible info overlays and text",
                                 "Configure", "info", false,

@@ -45,6 +45,9 @@ public final class SettingsRedesignTests {
     public static void runAllTests() {
         testSleepTimerSmartDurationLadderAndExtension();
         testSleepTimerModalStateInteractions();
+        testSlideDurationCyclicLadderModalAndDreamView();
+        testSettingsInlineSearchBarAndMultiScreenCoverage();
+        testSettingsScroll66PercentAnchorAndBottomClamp();
         testRedesignedRootHierarchyAndConditionalInitialSetup();
         testClutterConsolidationAndZeroConflatedDuplicates();
         testNativeAndroidTvParityAndDynamicTelemetry();
@@ -153,10 +156,232 @@ public final class SettingsRedesignTests {
         assertEquals(50, running.getMinutes(), "+5m adds to 50 min even after preset");
     }
 
+    private static void testSlideDurationCyclicLadderModalAndDreamView() {
+        // Exact 17-step cyclic sequence: 0 -> 10s -> 15s -> 20s -> 30s -> 45s -> 60s -> 1:30m -> 2m -> 5m -> 10m -> 15m -> 30m -> 45m -> 1h -> 1:30h -> 2h -> 0
+        long[] expectedMs = {
+                0L,
+                10_000L, 15_000L, 20_000L, 30_000L, 45_000L, 60_000L,
+                90_000L, 120_000L, 300_000L, 600_000L, 900_000L, 1_800_000L, 2_700_000L,
+                3_600_000L, 5_400_000L, 7_200_000L
+        };
+        String[] expectedLabels = {
+                "Don't change image",
+                "10s", "15s", "20s", "30s", "45s", "60s",
+                "1:30 min", "2 min", "5 min", "10 min", "15 min", "30 min", "45 min",
+                "1h", "1:30h", "2h"
+        };
+
+        assertEquals(expectedMs.length, Prefs.SAVER_INTERVALS_MS.length, "17 slide duration steps");
+        for (int i = 0; i < expectedMs.length; i++) {
+            assertEquals(expectedMs[i], Prefs.SAVER_INTERVALS_MS[i], "Step " + i + " ms matches");
+            assertEquals(expectedLabels[i], Prefs.formatSaverIntervalLabel(expectedMs[i]), "Step " + i + " label matches");
+        }
+
+        // Full cyclic walk UP (including 2h -> 0 wrap)
+        long cur = 0L;
+        for (int i = 1; i < expectedMs.length; i++) {
+            cur = Prefs.nextSaverIntervalUp(cur);
+            assertEquals(expectedMs[i], cur, "Up step " + i + " reaches " + expectedLabels[i]);
+        }
+        cur = Prefs.nextSaverIntervalUp(cur);
+        assertEquals(0L, cur, "Up from 2h wraps cleanly back to 0 (Don't change image)");
+
+        // Full cyclic walk DOWN (including 0 -> 2h wrap)
+        cur = 0L;
+        for (int i = expectedMs.length - 1; i >= 0; i--) {
+            cur = Prefs.nextSaverIntervalDown(cur);
+            assertEquals(expectedMs[i], cur, "Down step reaches " + expectedLabels[i]);
+        }
+
+        // Intermediate arbitrary values snap cleanly to next/prev ladder step
+        assertEquals(30_000L, Prefs.nextSaverIntervalUp(25_000L), "25s steps Up to 30s");
+        assertEquals(20_000L, Prefs.nextSaverIntervalDown(25_000L), "25s steps Down to 20s");
+        assertEquals(0L, Prefs.nextSaverIntervalUp(9_000_000L), "Above 2h wraps Up to 0");
+        assertEquals(7_200_000L, Prefs.nextSaverIntervalDown(9_000_000L), "Above 2h steps Down to 2h");
+
+        // SlideDurationModalState D-pad interactions & cyclic peek labels
+        ModalOverlayRenderer.SlideDurationModalState st = new ModalOverlayRenderer.SlideDurationModalState(0L);
+        assertTrue(st.isStaticMode(), "0 ms is static mode");
+        assertEquals("Don't change image", st.getLabel(), "0 ms displays Don't change image");
+        assertEquals("10s", st.getNextLabel(), "Next peek from 0 is 10s");
+        assertEquals("2h", st.getPrevLabel(), "Prev peek from 0 wraps to 2h");
+
+        assertTrue(st.moveFocus(0, -1), "D-pad Up moves duration forward");
+        assertEquals(10_000L, st.getIntervalMs(), "Up from 0 -> 10s");
+        assertFalse(st.isStaticMode(), "10s is not static mode");
+        assertTrue(st.moveFocus(0, 1), "D-pad Down moves duration backward");
+        assertEquals(0L, st.getIntervalMs(), "Down from 10s -> 0");
+        assertTrue(st.moveFocus(0, 1), "D-pad Down from 0 wraps to 2h");
+        assertEquals(7_200_000L, st.getIntervalMs(), "Down from 0 wraps to 2h");
+        assertEquals("Don't change image", st.getNextLabel(), "Next peek from 2h wraps to Don't change image");
+
+        // DreamView auto-advance & Ken Burns guard when intervalMs == 0 ("Don't change image")
+        assertFalse(DreamView.shouldAutoAdvanceSlide(0L, 0L), "0 ms interval never auto-advances at t=0");
+        assertFalse(DreamView.shouldAutoAdvanceSlide(36_000_000L, 0L), "0 ms interval never auto-advances even after 10h");
+        assertFalse(DreamView.shouldAutoAdvanceSlide(29_999L, 30_000L), "30s interval does not advance at 29.999s");
+        assertTrue(DreamView.shouldAutoAdvanceSlide(30_000L, 30_000L), "30s interval advances at 30.000s");
+
+        assertEquals(0f, DreamView.computeKenBurnsProgress(0L, 0L), "Static Ken Burns starts at 0");
+        assertTrue(Math.abs(DreamView.computeKenBurnsProgress(DreamView.STATIC_KEN_BURNS_HALF_PERIOD_MS, 0L) - 1f) < 0.001f,
+                "Static Ken Burns peaks smoothly at 1.0 at half period");
+        assertTrue(Math.abs(DreamView.computeKenBurnsProgress(DreamView.STATIC_KEN_BURNS_HALF_PERIOD_MS * 2L, 0L)) < 0.001f,
+                "Static Ken Burns breathes back to 0.0 at full period");
+    }
+
+    private static void testSettingsInlineSearchBarAndMultiScreenCoverage() {
+        SettingsTree.StateSnapshot snap = new SettingsTree.StateSnapshot();
+        snap.initialSetupDone = true;
+        snap.referenceNowMs = 1768478400000L; // 2026-01-15 12:00 UTC
+        snap.availableLanguages = Arrays.asList(
+                new String[] {"en", "English"},
+                new String[] {"de", "Deutsch"},
+                new String[] {"fr", "Français"},
+                new String[] {"nl", "Nederlands"},
+                new String[] {"ja", "日本語"},
+                new String[] {"zh-CN", "简体中文"}
+        );
+        SettingsTree.Node root = SettingsTree.buildRoot(snap);
+
+        SettingsTree.Node ssTz = root.findById("ss_tz");
+        SettingsTree.Node tvGenres = root.findById("hg_tv_genres");
+        SettingsTree.Node movieGenres = root.findById("hg_movie_genres");
+        SettingsTree.Node displayLang = root.findById("sys_soartv_lang");
+        SettingsTree.Node colorSwatches = root.findById("gaming_colors_rainbow");
+        SettingsTree.Node infoToggles = root.findById("ss_info_toggles");
+        SettingsTree.Node ssCategory = root.findById("ss_category");
+        SettingsTree.Node ssClock = root.findById("ss_clock");
+        SettingsTree.Node network = root.findById("network_internet");
+
+        // 1. All long/multi-item leaf screens expose the Search Bar; short/preview/parent screens do not
+        assertTrue(SettingsScreenRenderer.isSearchableColumn(ssTz), "Second Clock Timezone (61 rows) is searchable");
+        assertTrue(SettingsScreenRenderer.isSearchableColumn(tvGenres), "TV Shows Genres (38 rows) is searchable");
+        assertTrue(SettingsScreenRenderer.isSearchableColumn(movieGenres), "Movies Genres (38 rows) is searchable");
+        assertTrue(SettingsScreenRenderer.isSearchableColumn(displayLang), "SoarTV Display Language is searchable");
+        assertTrue(SettingsScreenRenderer.isSearchableColumn(colorSwatches), "Controller Color Swatches (18 rows) is searchable");
+        assertFalse(SettingsScreenRenderer.isSearchableColumn(infoToggles), "Short 6-row On-Screen Info list is not cluttered with search");
+        assertFalse(SettingsScreenRenderer.isSearchableColumn(ssCategory), "Live-preview Photography Category is not searchable");
+        assertFalse(SettingsScreenRenderer.isSearchableColumn(ssClock), "Live-preview Clock Style is not searchable");
+        assertFalse(SettingsScreenRenderer.isSearchableColumn(network), "Short 3-row Network panel is not searchable");
+        assertFalse(SettingsScreenRenderer.isSearchableColumn(root), "Root rail with grandchildren is not searchable");
+
+        // 2. Second Clock Timezone search (city name, prefix ranking, airport code, country alias, accent folding, UTC offset)
+        List<SettingsTree.Node> amsHits = SettingsScreenRenderer.filterNodesForSearch(ssTz, ssTz.children, "amsterdam");
+        assertEquals(1, amsHits.size(), "Searching 'amsterdam' finds exactly 1 city");
+        assertEquals("ss_tz:Europe/Amsterdam:AMS", amsHits.get(0).id, "Amsterdam match is Europe/Amsterdam:AMS");
+
+        List<SettingsTree.Node> amPrefix = SettingsScreenRenderer.filterNodesForSearch(ssTz, ssTz.children, "am");
+        assertTrue(!amPrefix.isEmpty(), "Searching 'am' returns matches");
+        assertEquals("ss_tz:Europe/Amsterdam:AMS", amPrefix.get(0).id,
+                "Title-prefix 'Amsterdam' ranks #1 ahead of America/* IANA timezone matches");
+
+        List<SettingsTree.Node> nlHits = SettingsScreenRenderer.filterNodesForSearch(ssTz, ssTz.children, "netherlands");
+        assertTrue(nlHits.stream().anyMatch(n -> "ss_tz:Europe/Amsterdam:AMS".equals(n.id)),
+                "Country search 'netherlands' finds Amsterdam");
+
+        List<SettingsTree.Node> codeHits = SettingsScreenRenderer.filterNodesForSearch(ssTz, ssTz.children, "ams");
+        assertTrue(codeHits.stream().anyMatch(n -> "ss_tz:Europe/Amsterdam:AMS".equals(n.id)),
+                "Airport code 'ams' finds Amsterdam");
+
+        List<SettingsTree.Node> accentHits = SettingsScreenRenderer.filterNodesForSearch(ssTz, ssTz.children, "sao paulo");
+        assertEquals(1, accentHits.size(), "Accent-folded 'sao paulo' matches São Paulo");
+        assertEquals("ss_tz:America/Sao_Paulo:SAO", accentHits.get(0).id, "São Paulo matched cleanly");
+
+        List<SettingsTree.Node> emptyQ = SettingsScreenRenderer.filterNodesForSearch(ssTz, ssTz.children, "   ");
+        assertEquals(61, emptyQ.size(), "Blank search returns all 61 timezones untouched");
+
+        List<SettingsTree.Node> zeroHits = SettingsScreenRenderer.filterNodesForSearch(ssTz, ssTz.children, "zzzznotacity");
+        assertEquals(0, zeroHits.size(), "Non-matching query returns empty list cleanly");
+
+        // 3. TV & Movie Genres search
+        List<SettingsTree.Node> sciHits = SettingsScreenRenderer.filterNodesForSearch(tvGenres, tvGenres.children, "sci-fi");
+        assertTrue(!sciHits.isEmpty() && sciHits.get(0).id.equals("genre_tv_item:Sci-Fi"),
+                "Searching 'sci-fi' in TV Shows Genres finds Sci-Fi");
+        List<SettingsTree.Node> crimeHits = SettingsScreenRenderer.filterNodesForSearch(movieGenres, movieGenres.children, "true crime");
+        assertTrue(!crimeHits.isEmpty() && crimeHits.get(0).id.equals("genre_movie_item:True Crime"),
+                "Multi-token 'true crime' in Movies Genres finds True Crime");
+
+        // 4. Display Language search (English aliases + accent-folded native names)
+        List<SettingsTree.Node> jpHits = SettingsScreenRenderer.filterNodesForSearch(displayLang, displayLang.children, "japanese");
+        assertTrue(jpHits.stream().anyMatch(n -> "sys_soartv_lang:ja".equals(n.id)),
+                "Searching English name 'japanese' finds native '日本語'");
+        List<SettingsTree.Node> frHits = SettingsScreenRenderer.filterNodesForSearch(displayLang, displayLang.children, "francais");
+        assertTrue(frHits.stream().anyMatch(n -> "sys_soartv_lang:fr".equals(n.id)),
+                "Accent-folded 'francais' finds 'Français'");
+        List<SettingsTree.Node> nlLangHits = SettingsScreenRenderer.filterNodesForSearch(displayLang, displayLang.children, "dutch");
+        assertTrue(nlLangHits.stream().anyMatch(n -> "sys_soartv_lang:nl".equals(n.id)),
+                "Searching English name 'dutch' finds 'Nederlands'");
+
+        // 5. Controller Color Swatches search
+        List<SettingsTree.Node> emeraldHits = SettingsScreenRenderer.filterNodesForSearch(colorSwatches, colorSwatches.children, "emerald");
+        assertTrue(!emeraldHits.isEmpty() && emeraldHits.get(0).id.equals("gaming_color_swatch:Emerald Green"),
+                "Searching 'emerald' finds Emerald Green swatch");
+
+        // 6. Placeholders are tailored and emoji-free
+        for (SettingsTree.Node n : Arrays.asList(ssTz, tvGenres, movieGenres, displayLang, colorSwatches)) {
+            String ph = SettingsScreenRenderer.searchPlaceholderForColumn(n);
+            assertTrue(ph != null && !ph.isEmpty(), "Placeholder non-empty for " + n.id);
+            assertFalse(containsEmoji(ph), "Zero emojis in search placeholder for " + n.id);
+        }
+    }
+
+    private static void testSettingsScroll66PercentAnchorAndBottomClamp() {
+        float viewportH = 790f;
+        float rowH = 78f;
+        float gap = 8f;
+        float step = rowH + gap; // 86px per row
+
+        // 1. Non-overflowing list (8 rows = 680px <= 790px): scrollY is ALWAYS 0
+        float shortContentH = 8 * rowH + 7 * gap;
+        for (int i = 0; i < 8; i++) {
+            float top = i * step;
+            assertEquals(0f, SettingsScreenRenderer.computeColumnScrollY(shortContentH, viewportH, top, top + rowH),
+                    "Non-overflowing list never scrolls at row " + i);
+        }
+
+        // 2. Overflowing list (20 rows = 1712px > 790px, maxScroll = 922px)
+        float longContentH = 20 * rowH + 19 * gap; // 1712
+        float maxScroll = longContentH - viewportH; // 922
+        float targetAnchorY = viewportH * 0.66f; // 521.4
+
+        // Rows 0..5 are above 66% -> scrollY stays 0 (zero empty space at top)
+        for (int i = 0; i <= 5; i++) {
+            float top = i * step;
+            assertEquals(0f, SettingsScreenRenderer.computeColumnScrollY(longContentH, viewportH, top, top + rowH),
+                    "Top row " + i + " keeps scrollY = 0");
+        }
+
+        // Middle rows (6..16) with hidden rows still below -> hovered row center stays anchored at 66% down!
+        for (int i = 6; i <= 16; i++) {
+            float top = i * step;
+            float bot = top + rowH;
+            float scrollY = SettingsScreenRenderer.computeColumnScrollY(longContentH, viewportH, top, bot);
+            float screenCenterY = (top + bot) * 0.5f - scrollY;
+            assertTrue(Math.abs(screenCenterY - targetAnchorY) < 0.01f,
+                    "Middle row " + i + " stays anchored at 66% down (" + screenCenterY + " vs " + targetAnchorY + ")");
+            assertTrue(viewportH - (bot - scrollY) > 2f * rowH,
+                    "At least 2+ upcoming rows remain visible below hovered middle row " + i);
+        }
+
+        // Bottom rows (17..19) when NO MORE hidden rows remain below -> clamps at maxScroll (ZERO empty bottom rows!)
+        for (int i = 17; i <= 19; i++) {
+            float top = i * step;
+            float bot = top + rowH;
+            float scrollY = SettingsScreenRenderer.computeColumnScrollY(longContentH, viewportH, top, bot);
+            assertEquals(maxScroll, scrollY, "Bottom row " + i + " clamps to maxScroll so zero empty rows appear");
+        }
+        // Very last row (index 19) sits flush at the bottom of the viewport
+        float lastTop = 19 * step;
+        float lastBot = lastTop + rowH;
+        float lastScroll = SettingsScreenRenderer.computeColumnScrollY(longContentH, viewportH, lastTop, lastBot);
+        assertEquals(viewportH, lastBot - lastScroll, "Last row bottom aligns flush with viewport bottom");
+    }
+
     private static void testRedesignedRootHierarchyAndConditionalInitialSetup() {
-        // Case A: Initial setup COMPLETED -> Root starts directly with TV & Connectivity (zero setup clutter at top)
+        // Case A: Initial setup COMPLETED (explicit flag) -> Root starts directly with TV & Connectivity,
+        // and Initial Setup & Cloud moves cleanly to the very bottom of the Settings rail (not duplicated in System)
         SettingsTree.StateSnapshot doneSnap = new SettingsTree.StateSnapshot();
         doneSnap.initialSetupDone = true;
+        assertTrue(SettingsTree.isInitialSetupCompleted(doneSnap), "Explicit initialSetupDone marks setup completed");
         SettingsTree.Node doneRoot = SettingsTree.buildRoot(doneSnap);
 
         List<SettingsTree.Node> selectableRoot = new ArrayList<>();
@@ -167,7 +392,7 @@ public final class SettingsRedesignTests {
         }
 
         assertEquals(3, sectionHeaders.size(), "Completed root has 3 clean section headers");
-        assertEquals(10, selectableRoot.size(), "Completed root has exactly 10 compact top-level categories (fits without scroll)");
+        assertEquals(11, selectableRoot.size(), "Completed root has 10 daily categories plus completed Initial Setup at the bottom");
         assertEquals("network_internet", selectableRoot.get(0).id, "Category 1: Network & Internet");
         assertEquals("display_sound", selectableRoot.get(1).id, "Category 2: Display & Sound");
         assertEquals("channels_inputs", selectableRoot.get(2).id, "Category 3: Channels & Inputs");
@@ -178,16 +403,43 @@ public final class SettingsRedesignTests {
         assertEquals("users", selectableRoot.get(7).id, "Category 8: Accounts & Profiles");
         assertEquals("apps_privacy", selectableRoot.get(8).id, "Category 9: Apps & Privacy");
         assertEquals("system_settings", selectableRoot.get(9).id, "Category 10: System");
+        assertEquals("initial_setup", selectableRoot.get(10).id, "Completed Initial Setup & Cloud moves to the bottom of Settings");
+        assertEquals(SettingsTree.StatusTone.POSITIVE, selectableRoot.get(10).statusTone,
+                "Completed Initial Setup uses POSITIVE status tone");
+        assertEquals("Completed", selectableRoot.get(10).value,
+                "Completed Initial Setup displays Completed badge");
 
-        // Initial Setup & Cloud is still reachable inside System when completed
+        // Completed Initial Setup is not duplicated inside System
         SettingsTree.Node sysNode = doneRoot.findById("system_settings");
-        assertTrue(sysNode != null && sysNode.findById("initial_setup") != null,
-                "Initial Setup & Cloud remains accessible under System after completion");
+        assertTrue(sysNode != null && sysNode.findById("initial_setup") == null,
+                "Completed Initial Setup lives at the bottom of Settings without duplication inside System");
 
-        // Case B: Initial setup INCOMPLETE -> Promoted at the very top of root with WARNING badge
+        // Case B: All 6 setup steps completed even without explicit initialSetupDone flag -> also moves to bottom
+        SettingsTree.StateSnapshot allStepsSnap = new SettingsTree.StateSnapshot();
+        allStepsSnap.initialSetupDone = false;
+        allStepsSnap.referenceNowMs = 1_700_000_000_000L;
+        allStepsSnap.pairedRemotes = java.util.Collections.singletonList(
+                new RemoteAuthManager.PairedDevice("dev1", "Living Phone", "sha256_tok", RemoteAuthManager.Role.ADMIN,
+                        "user@example.com", 1_699_000_000_000L, 0L, 1_699_999_000_000L));
+        allStepsSnap.traktConnected = true;
+        allStepsSnap.stremioConnected = true;
+        allStepsSnap.tvRoom = "Living Room";
+        allStepsSnap.discoveredWizBulbs = 2;
+        allStepsSnap.hasTmdbKey = true;
+        assertTrue(SettingsTree.isInitialSetupCompleted(allStepsSnap),
+                "Completing all 6 setup steps marks Initial Setup completed automatically");
+        SettingsTree.Node allStepsRoot = SettingsTree.buildRoot(allStepsSnap);
+        int allStepsFirstIdx = SettingsScreenRenderer.firstSelectableIndex(allStepsRoot.children);
+        assertEquals("network_internet", allStepsRoot.children.get(allStepsFirstIdx).id,
+                "All-steps-completed root starts directly on Network & Internet");
+        assertEquals("initial_setup", allStepsRoot.children.get(allStepsRoot.children.size() - 1).id,
+                "All-steps-completed Initial Setup moves to the very bottom of Settings");
+
+        // Case C: Initial setup INCOMPLETE -> Promoted at the very top of root with WARNING badge
         SettingsTree.StateSnapshot freshSnap = new SettingsTree.StateSnapshot();
         freshSnap.initialSetupDone = false;
         freshSnap.traktConnected = false;
+        assertFalse(SettingsTree.isInitialSetupCompleted(freshSnap), "Incomplete setup is not marked completed");
         SettingsTree.Node freshRoot = SettingsTree.buildRoot(freshSnap);
 
         int firstIdx = SettingsScreenRenderer.firstSelectableIndex(freshRoot.children);
@@ -196,6 +448,8 @@ public final class SettingsRedesignTests {
         assertEquals("initial_setup", firstSelectable.id, "Incomplete Initial Setup is promoted to top of root");
         assertEquals(SettingsTree.StatusTone.WARNING, firstSelectable.statusTone,
                 "Incomplete Initial Setup uses WARNING status tone");
+        assertEquals("system_settings", freshRoot.children.get(freshRoot.children.size() - 1).id,
+                "Incomplete Initial Setup is not duplicated at the bottom of root");
     }
 
     private static void testClutterConsolidationAndZeroConflatedDuplicates() {

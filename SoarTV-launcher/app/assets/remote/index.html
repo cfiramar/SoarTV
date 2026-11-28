@@ -1607,6 +1607,88 @@
       font-weight: 700;
     }
 
+    /* Multi-TV Household Switcher Inside TV Screens Sheet */
+    .household-tvs-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      margin-bottom: 12px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--lg-border);
+    }
+
+    .household-tvs-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--ink-50);
+    }
+
+    .household-tvs-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .household-tv-row {
+      width: 100%;
+      background: var(--row-bg);
+      border: 1px solid var(--lg-border);
+      color: var(--ink-92);
+      padding: 10px 12px;
+      border-radius: 14px;
+      font-family: inherit;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      cursor: pointer;
+      text-align: left;
+    }
+
+    .household-tv-row.active {
+      background: var(--selected-bg);
+      color: var(--selected-ink);
+      border-color: var(--selected-border);
+      box-shadow: var(--selected-shadow);
+    }
+
+    .household-tv-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    .household-tv-name {
+      font-size: 13px;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .household-tv-sub {
+      font-size: 11px;
+      opacity: 0.72;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .household-tv-badge {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: rgba(128, 128, 148, 0.18);
+      flex-shrink: 0;
+    }
+
     .device-controls-row {
       display: flex;
       flex-wrap: wrap;
@@ -1790,6 +1872,16 @@
         <button class="orb-sm lg-sm" style="width:32px;height:32px;" onclick="closeSheet('screens')" aria-label="Close">
           <svg class="icon icon-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
+      </div>
+
+      <div id="householdTvsSection" class="household-tvs-wrap" style="display:none;">
+        <div class="household-tvs-head">
+          <span>Household TVs</span>
+          <button class="orb-sm lg-sm" style="width:26px;height:26px;" onclick="refreshHouseholdTvDirectory(true)" aria-label="Refresh Household TVs">
+            <svg class="icon icon-sm" style="width:13px;height:13px;" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          </button>
+        </div>
+        <div id="householdTvsList" class="household-tvs-list"></div>
       </div>
 
       <div class="segmented-pills" role="group" aria-label="Home Media Mode">

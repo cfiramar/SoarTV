@@ -459,6 +459,15 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private boolean settingsFocusRight = false;
     private int settingsRightIndex = 0;
     private boolean reorderSettingsGenre = false;
+    private String settingsSearchQuery = "";
+    private boolean settingsSearchBarFocused = false;
+    private boolean settingsSearchClearFocused = false;
+    private EditText settingsSearchEdit;
+    private boolean settingsSearchSyncingEdit = false;
+    private String cachedSettingsFilterParentId = null;
+    private String cachedSettingsFilterQuery = null;
+    private List<SettingsTree.Node> cachedSettingsFilterSource = null;
+    private List<SettingsTree.Node> cachedSettingsFilteredList = null;
     private android.app.AlertDialog traktAuthDialog;
     private android.app.AlertDialog stremioAuthDialog;
 
@@ -466,6 +475,12 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private boolean sleepModalOpen = false;
     private ModalOverlayRenderer.SleepTimerModalState sleepModalState = null;
     private long sleepModalOpenedAt = 0L;
+
+    // Interactive Liquid Glass Cyclic Up/Down Screensaver Slide Duration Modal state
+    private boolean slideDurationModalOpen = false;
+    private boolean slideDurationModalDirty = false;
+    private ModalOverlayRenderer.SlideDurationModalState slideDurationModalState = null;
+    private long slideDurationModalOpenedAt = 0L;
 
     private boolean streamQualityModalOpen = false;
     private boolean streamQualityModalDirty = false;
@@ -1671,6 +1686,17 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             }
         });
         recs.setSyncProgressListener((step, pct, done) -> updateSyncModal(step, pct, done));
+        CloudSyncManager.get(a).setUiRefreshCallback(() -> handler.post(() -> {
+            Prefs.reload();
+            recs.clearRowCache();
+            recs.refreshIfStale();
+            reload();
+            rebuildSettingsTree();
+            layoutLight();
+            statusDirty = true;
+            heroDirty = true;
+            invalidateAll();
+        }));
         checkNight(false);
         sheetLayer.setVisibility(INVISIBLE);
         scene.setMotion(0.6f, 0f);
@@ -1718,6 +1744,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         recs.addListener(this);
         Recs.setBackgroundActivityPaused(false);
         ScreensaverCatalog.setBackgroundActivityPaused(false);
+        CloudSyncManager.get(getContext().getApplicationContext()).setBackgroundPaused(false);
         if (ScreensaverCatalog.consumePausedPrefetchNeedsResume()) {
             ScreensaverCatalog.prefetchAsync(getContext());
         }
@@ -1805,6 +1832,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             toastLayer.invalidate();
         }
         closeMenu(true);
+        hideSettingsSearchSoftInput();
         Choreographer.getInstance().removeFrameCallback(this);
         handler.removeCallbacks(tick);
         handler.removeCallbacks(reloadSoon);
@@ -1814,6 +1842,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         recs.removeListener(this);
         Recs.setBackgroundActivityPaused(true);
         ScreensaverCatalog.setBackgroundActivityPaused(true);
+        CloudSyncManager.get(getContext().getApplicationContext()).setBackgroundPaused(true);
         recs.flushPendingSaveAsync();
         RemoteControlServer.get(getContext().getApplicationContext()).detachHost(this);
         if (tvInputs != null) tvInputs.unregisterCallback(inputCallback);
@@ -2037,6 +2066,33 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             }
             return;
         }
+        if (slideDurationModalOpen && slideDurationModalState != null) {
+            switch (keyCode) {
+                case KeyEvent.KEYCODE_DPAD_UP:
+                case KeyEvent.KEYCODE_DPAD_RIGHT:
+                    slideDurationModalState.stepUp();
+                    persistSlideDurationModalValue();
+                    click.move();
+                    toastLayer.invalidate();
+                    break;
+                case KeyEvent.KEYCODE_DPAD_DOWN:
+                case KeyEvent.KEYCODE_DPAD_LEFT:
+                    slideDurationModalState.stepDown();
+                    persistSlideDurationModalValue();
+                    click.move();
+                    toastLayer.invalidate();
+                    break;
+                case KeyEvent.KEYCODE_DPAD_CENTER:
+                case KeyEvent.KEYCODE_ENTER:
+                case KeyEvent.KEYCODE_NUMPAD_ENTER:
+                case KeyEvent.KEYCODE_BACK:
+                    closeSlideDurationModal();
+                    break;
+                default:
+                    break;
+            }
+            return;
+        }
         if (sleepModalOpen && sleepModalState != null) {
             switch (keyCode) {
                 case KeyEvent.KEYCODE_DPAD_UP:
@@ -2188,6 +2244,16 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             case KeyEvent.KEYCODE_NUMPAD_ENTER:
                 activate();
                 break;
+            case KeyEvent.KEYCODE_DEL:
+            case KeyEvent.KEYCODE_FORWARD_DEL:
+                if (activeScreen == SCREEN_SETTINGS && zone == Z_CARDS && isCurrentSettingsColumnSearchable()
+                        && settingsSearchQuery != null && !settingsSearchQuery.isEmpty()) {
+                    settingsSearchBarFocused = true;
+                    updateSettingsSearchQuery(
+                            settingsSearchQuery.substring(0, settingsSearchQuery.length() - 1), false);
+                    click.move();
+                }
+                break;
             case KeyEvent.KEYCODE_MENU:
                 hold();
                 break;
@@ -2241,6 +2307,31 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                     "io.soartv",
                     "SoarTV",
                     secret,
+                    rev,
+                    System.currentTimeMillis()
+            );
+        }
+        if (activeScreen == SCREEN_SETTINGS && isCurrentSettingsColumnSearchable()) {
+            SettingsTree.Node leftParent = currentSettingsLeftParent();
+            String q = settingsSearchQuery != null ? settingsSearchQuery : "";
+            String hint = SettingsScreenRenderer.searchPlaceholderForColumn(leftParent);
+            String parentId = leftParent != null ? leftParent.id : "";
+            long rev;
+            synchronized (hostFocusedInputLock) {
+                String sig = "settings_search|" + parentId + "|" + q;
+                if (!sig.equals(lastHostFocusedInputSig)) {
+                    lastHostFocusedInputSig = sig;
+                    hostFocusedInputRev++;
+                }
+                rev = hostFocusedInputRev;
+            }
+            return new TvInputFieldSync.InputSnapshot(
+                    true,
+                    q,
+                    hint,
+                    "io.soartv",
+                    "SoarTV Settings",
+                    false,
                     rev,
                     System.currentTimeMillis()
             );
@@ -2358,6 +2449,24 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                     false
             );
         }
+        // 5b. Screensaver Slide Duration interactive modal
+        if (slideDurationModalOpen && slideDurationModalState != null) {
+            return new TvRemoteBridge.ActiveModal(
+                    true,
+                    "slide_duration:" + slideDurationModalState.getIntervalMs(),
+                    TvRemoteBridge.KIND_ACTIONS,
+                    "Slide Duration",
+                    slideDurationModalState.getLabel() + " \u00B7 " + slideDurationModalState.getCaption(),
+                    "",
+                    "",
+                    "",
+                    java.util.Arrays.asList(
+                            new TvRemoteBridge.ModalAction("slide_dur_up", "Next (" + slideDurationModalState.getNextLabel() + ")", "secondary"),
+                            new TvRemoteBridge.ModalAction("slide_dur_down", "Previous (" + slideDurationModalState.getPrevLabel() + ")", "secondary"),
+                            new TvRemoteBridge.ModalAction("dismiss", "Done", "primary")),
+                    false
+            );
+        }
         // 5. Sleep Timer interactive modal
         if (sleepModalOpen && sleepModalState != null) {
             int mins = sleepModalState.getMinutes();
@@ -2467,6 +2576,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 closeLiquidGlassModal(true);
                 return;
             }
+            if (slideDurationModalOpen) {
+                closeSlideDurationModal();
+                return;
+            }
             if (sleepModalOpen) {
                 closeSleepTimerModal();
                 return;
@@ -2532,6 +2645,20 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             } catch (NumberFormatException ignored) {}
             return;
         }
+        if (slideDurationModalOpen && slideDurationModalState != null) {
+            if ("slide_dur_up".equals(id)) {
+                slideDurationModalState.stepUp();
+                persistSlideDurationModalValue();
+                click.move();
+                toastLayer.invalidate();
+            } else if ("slide_dur_down".equals(id)) {
+                slideDurationModalState.stepDown();
+                persistSlideDurationModalValue();
+                click.move();
+                toastLayer.invalidate();
+            }
+            return;
+        }
         if (sleepModalOpen && sleepModalState != null) {
             if ("sleep_save".equals(id)) {
                 saveSleepTimerModal();
@@ -2564,6 +2691,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             if (submitSearch) {
                 confirmLiquidGlassInputModal();
             }
+            return;
+        }
+        if (activeScreen == SCREEN_SETTINGS && isCurrentSettingsColumnSearchable()) {
+            updateSettingsSearchQuery(safe, submitSearch);
             return;
         }
         if (activeScreen == SCREEN_SEARCH && replaceInput) {
@@ -2798,6 +2929,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     void reset(boolean animated) {
         wake();
         closeLiquidGlassModal(false);
+        if (slideDurationModalOpen) {
+            closeSlideDurationModal();
+        }
+        clearSettingsSearchState(true);
         if (gameLaunchModalOpen) {
             GamingZone.cancelActiveGameLaunch();
             closeGameLaunchModal();
@@ -2943,6 +3078,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                     clamped);
         }
         if (activeScreen == SCREEN_SETTINGS && clamped != SCREEN_SETTINGS) {
+            clearSettingsSearchState(true);
             settingsPathIds.clear();
             settingsStepDepthStack.clear();
             java.util.Arrays.fill(settingsDepthIndices, 0);
@@ -3381,6 +3517,9 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         if (lgHiddenEdit != null) {
             measure(lgHiddenEdit, 1, 1);
         }
+        if (settingsSearchEdit != null) {
+            measure(settingsSearchEdit, 1, 1);
+        }
         setMeasuredDimension(width, height);
     }
 
@@ -3405,6 +3544,9 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         recentLayer.layout(0, 0, width, height);
         if (lgHiddenEdit != null) {
             lgHiddenEdit.layout(0, 0, 1, 1);
+        }
+        if (settingsSearchEdit != null) {
+            settingsSearchEdit.layout(0, 0, 1, 1);
         }
     }
 
@@ -6029,6 +6171,178 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         } catch (Throwable ignored) {
             lgHiddenEdit = null;
         }
+        try {
+            settingsSearchEdit = new EditText(a);
+            settingsSearchEdit.setAlpha(0f);
+            settingsSearchEdit.setBackground(null);
+            settingsSearchEdit.setSingleLine(true);
+            settingsSearchEdit.setFocusable(true);
+            settingsSearchEdit.setFocusableInTouchMode(true);
+            settingsSearchEdit.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
+            settingsSearchEdit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+            settingsSearchEdit.setImeOptions(EditorInfo.IME_ACTION_SEARCH | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+            settingsSearchEdit.setVisibility(GONE);
+            settingsSearchEdit.addTextChangedListener(new TextWatcher() {
+                @Override
+                public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+                @Override
+                public void onTextChanged(CharSequence s, int start, int before, int count) {}
+
+                @Override
+                public void afterTextChanged(Editable s) {
+                    if (settingsSearchSyncingEdit || activeScreen != SCREEN_SETTINGS || !isCurrentSettingsColumnSearchable()) {
+                        return;
+                    }
+                    String next = s != null ? s.toString() : "";
+                    if (!next.equals(settingsSearchQuery)) {
+                        settingsSearchQuery = next;
+                        settingsSearchClearFocused = false;
+                        invalidateSettingsSearchCache();
+                        int depth = Math.min(settingsPathIds.size(), settingsDepthIndices.length - 1);
+                        settingsDepthIndices[depth] = 0;
+                        heroDirty = true;
+                        heroLayer.invalidate();
+                        wake();
+                    }
+                }
+            });
+            settingsSearchEdit.setOnEditorActionListener((v, actionId, event) -> {
+                if (activeScreen != SCREEN_SETTINGS || !isCurrentSettingsColumnSearchable()) return false;
+                if (actionId == EditorInfo.IME_ACTION_SEARCH
+                        || actionId == EditorInfo.IME_ACTION_DONE
+                        || actionId == EditorInfo.IME_ACTION_GO
+                        || actionId == EditorInfo.IME_ACTION_NEXT) {
+                    hideSettingsSearchSoftInput();
+                    List<SettingsTree.Node> matches = currentSettingsDisplayLeftList(currentSettingsLeftParent());
+                    if (!matches.isEmpty()) {
+                        settingsSearchBarFocused = false;
+                        settingsSearchClearFocused = false;
+                        int depth = Math.min(settingsPathIds.size(), settingsDepthIndices.length - 1);
+                        settingsDepthIndices[depth] = SettingsScreenRenderer.firstSelectableIndex(matches);
+                    }
+                    heroDirty = true;
+                    heroLayer.invalidate();
+                    wake();
+                    return true;
+                }
+                return false;
+            });
+            addView(settingsSearchEdit);
+        } catch (Throwable ignored) {
+            settingsSearchEdit = null;
+        }
+    }
+
+    private void syncSettingsSearchEditFromQuery() {
+        if (settingsSearchEdit == null) return;
+        settingsSearchSyncingEdit = true;
+        try {
+            String val = settingsSearchQuery != null ? settingsSearchQuery : "";
+            settingsSearchEdit.setText(val);
+            settingsSearchEdit.setSelection(val.length());
+        } catch (Throwable ignored) {
+        } finally {
+            settingsSearchSyncingEdit = false;
+        }
+    }
+
+    private void showSettingsSearchSoftInput() {
+        if (settingsSearchEdit == null) return;
+        try {
+            settingsSearchEdit.setVisibility(VISIBLE);
+            syncSettingsSearchEditFromQuery();
+            settingsSearchEdit.requestFocus();
+            InputMethodManager imm = (InputMethodManager) activity.getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) {
+                imm.showSoftInput(settingsSearchEdit, 0);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void hideSettingsSearchSoftInput() {
+        if (settingsSearchEdit == null) return;
+        try {
+            InputMethodManager imm = (InputMethodManager) activity.getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) {
+                imm.hideSoftInputFromWindow(settingsSearchEdit.getWindowToken(), 0);
+            }
+            settingsSearchEdit.clearFocus();
+            settingsSearchEdit.setVisibility(GONE);
+            requestFocus();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void invalidateSettingsSearchCache() {
+        cachedSettingsFilterParentId = null;
+        cachedSettingsFilterQuery = null;
+        cachedSettingsFilterSource = null;
+        cachedSettingsFilteredList = null;
+    }
+
+    private void clearSettingsSearchState(boolean hideIme) {
+        settingsSearchQuery = "";
+        settingsSearchBarFocused = false;
+        settingsSearchClearFocused = false;
+        invalidateSettingsSearchCache();
+        syncSettingsSearchEditFromQuery();
+        if (hideIme) {
+            hideSettingsSearchSoftInput();
+        }
+    }
+
+    private boolean isSettingsColumnSearchable(SettingsTree.Node leftParent) {
+        return SettingsScreenRenderer.isLastColumnFullWidth(settingsPathIds, leftParent)
+                && SettingsScreenRenderer.isSearchableColumn(leftParent);
+    }
+
+    private boolean isCurrentSettingsColumnSearchable() {
+        if (settingsRoot == null) return false;
+        return isSettingsColumnSearchable(currentSettingsLeftParent());
+    }
+
+    private List<SettingsTree.Node> currentSettingsDisplayLeftList(SettingsTree.Node leftParent) {
+        if (leftParent == null || leftParent.children == null || leftParent.children.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+        if (!isSettingsColumnSearchable(leftParent) || settingsSearchQuery == null || settingsSearchQuery.trim().isEmpty()) {
+            return leftParent.children;
+        }
+        String parentId = leftParent.id;
+        if (cachedSettingsFilteredList != null
+                && parentId.equals(cachedSettingsFilterParentId)
+                && settingsSearchQuery.equals(cachedSettingsFilterQuery)
+                && cachedSettingsFilterSource == leftParent.children) {
+            return cachedSettingsFilteredList;
+        }
+        List<SettingsTree.Node> filtered = SettingsScreenRenderer.filterNodesForSearch(
+                leftParent, leftParent.children, settingsSearchQuery);
+        cachedSettingsFilterParentId = parentId;
+        cachedSettingsFilterQuery = settingsSearchQuery;
+        cachedSettingsFilterSource = leftParent.children;
+        cachedSettingsFilteredList = filtered;
+        return filtered;
+    }
+
+    private void updateSettingsSearchQuery(String nextRaw, boolean jumpToFirstResult) {
+        String safe = nextRaw != null ? nextRaw : "";
+        settingsSearchQuery = safe;
+        settingsSearchClearFocused = false;
+        invalidateSettingsSearchCache();
+        syncSettingsSearchEditFromQuery();
+        int depth = Math.min(settingsPathIds.size(), settingsDepthIndices.length - 1);
+        List<SettingsTree.Node> matches = currentSettingsDisplayLeftList(currentSettingsLeftParent());
+        settingsDepthIndices[depth] = matches.isEmpty() ? 0 : SettingsScreenRenderer.firstSelectableIndex(matches);
+        if (jumpToFirstResult && !matches.isEmpty()) {
+            hideSettingsSearchSoftInput();
+            settingsSearchBarFocused = false;
+            zone = Z_CARDS;
+        }
+        heroDirty = true;
+        heroLayer.invalidate();
+        wake();
     }
 
     private void syncHiddenEditFromInputState() {
@@ -6527,6 +6841,137 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 fill, border, lCardTitle, lSubTab, lSubTabOn, fitPaint);
     }
 
+    private void openSlideDurationModal() {
+        slideDurationModalState = new ModalOverlayRenderer.SlideDurationModalState(Prefs.saverIntervalMs());
+        slideDurationModalOpen = true;
+        slideDurationModalDirty = false;
+        slideDurationModalOpenedAt = SystemClock.uptimeMillis();
+        lastGamepadAxisDx = 0;
+        lastGamepadAxisDy = 0;
+        okDown = okHeld = backDown = false;
+        toastLayer.invalidate();
+        wake();
+        click.open();
+    }
+
+    private void persistSlideDurationModalValue() {
+        if (slideDurationModalState == null) return;
+        Prefs.setSaverIntervalMs(slideDurationModalState.getIntervalMs());
+        slideDurationModalDirty = true;
+        rebuildSettingsTree();
+        heroDirty = true;
+        heroLayer.invalidate();
+    }
+
+    private void closeSlideDurationModal() {
+        if (!slideDurationModalOpen) return;
+        ModalOverlayRenderer.SlideDurationModalState closingState = slideDurationModalState;
+        boolean changed = slideDurationModalDirty;
+        if (closingState != null && changed) {
+            Prefs.setSaverIntervalMs(closingState.getIntervalMs());
+        }
+        slideDurationModalOpen = false;
+        slideDurationModalDirty = false;
+        slideDurationModalState = null;
+        lastGamepadAxisDx = 0;
+        lastGamepadAxisDy = 0;
+        okDown = okHeld = backDown = false;
+        if (changed) {
+            rebuildSettingsTree();
+            heroDirty = true;
+            heroLayer.invalidate();
+        }
+        toastLayer.invalidate();
+        wake();
+        click.move();
+        if (changed && closingState != null) {
+            showToast(Ui.tr("Slide Duration: ") + Ui.tr(closingState.getLabel()));
+        }
+    }
+
+    private boolean handleSlideDurationModalKey(KeyEvent e) {
+        if (!slideDurationModalOpen || slideDurationModalState == null) return false;
+        int code = e.getKeyCode();
+        boolean down = e.getAction() == KeyEvent.ACTION_DOWN;
+        if (!down && SystemClock.uptimeMillis() - slideDurationModalOpenedAt < 180L) {
+            return true;
+        }
+        switch (code) {
+            case KeyEvent.KEYCODE_DPAD_UP:
+                if (down) {
+                    slideDurationModalState.stepUp();
+                    persistSlideDurationModalValue();
+                    click.move();
+                    toastLayer.invalidate();
+                }
+                return true;
+            case KeyEvent.KEYCODE_DPAD_DOWN:
+                if (down) {
+                    slideDurationModalState.stepDown();
+                    persistSlideDurationModalValue();
+                    click.move();
+                    toastLayer.invalidate();
+                }
+                return true;
+            case KeyEvent.KEYCODE_DPAD_RIGHT:
+                if (down) {
+                    slideDurationModalState.stepUp();
+                    persistSlideDurationModalValue();
+                    click.move();
+                    toastLayer.invalidate();
+                }
+                return true;
+            case KeyEvent.KEYCODE_DPAD_LEFT:
+                if (down) {
+                    slideDurationModalState.stepDown();
+                    persistSlideDurationModalValue();
+                    click.move();
+                    toastLayer.invalidate();
+                }
+                return true;
+            case KeyEvent.KEYCODE_DPAD_CENTER:
+            case KeyEvent.KEYCODE_ENTER:
+            case KeyEvent.KEYCODE_NUMPAD_ENTER:
+            case KeyEvent.KEYCODE_BUTTON_A:
+            case KeyEvent.KEYCODE_BACK:
+            case KeyEvent.KEYCODE_ESCAPE:
+            case KeyEvent.KEYCODE_BUTTON_B:
+                if (!down && !e.isCanceled()) {
+                    closeSlideDurationModal();
+                }
+                return true;
+            default:
+                return true;
+        }
+    }
+
+    private void handleSlideDurationModalTap(float x, float y) {
+        if (!slideDurationModalOpen || slideDurationModalState == null) return;
+        int hit = modalRenderer.hitTestSlideDurationModal(x, y);
+        if (hit == ModalOverlayRenderer.SD_HIT_OUTSIDE) {
+            closeSlideDurationModal();
+        } else if (hit == ModalOverlayRenderer.SD_HIT_UP) {
+            slideDurationModalState.stepUp();
+            persistSlideDurationModalValue();
+            click.move();
+            toastLayer.invalidate();
+        } else if (hit == ModalOverlayRenderer.SD_HIT_DOWN) {
+            slideDurationModalState.stepDown();
+            persistSlideDurationModalValue();
+            click.move();
+            toastLayer.invalidate();
+        }
+    }
+
+    private void drawSlideDurationModal(Canvas c) {
+        modalRenderer.drawSlideDurationModal(
+                getContext(), c, w, h, k,
+                slideDurationModalState,
+                scene, tone(glassLight(), SMOKE), tone(0.84f, 0.74f),
+                dark() > 0.5f, L_INK, L_DIM, WHITE,
+                fill, border, lCardTitle, lSubTab, lSubTabOn, fitPaint);
+    }
+
     private void openStreamQualityModal() {
         SettingsTree.StateSnapshot snap = SettingsTree.captureState(getContext(), data);
         streamQualityModalState = new ModalOverlayRenderer.StreamQualityModalState(
@@ -6736,7 +7181,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         boolean isController = (src & android.view.InputDevice.SOURCE_JOYSTICK) == android.view.InputDevice.SOURCE_JOYSTICK
                 || (src & android.view.InputDevice.SOURCE_GAMEPAD) == android.view.InputDevice.SOURCE_GAMEPAD;
         if (!isController) return false;
-        if (!streamQualityModalOpen && !sleepModalOpen) return false;
+        if (!streamQualityModalOpen && !sleepModalOpen && !slideDurationModalOpen) return false;
 
         int dx = ModalOverlayRenderer.resolveGamepadAxisDirection(
                 e.getAxisValue(MotionEvent.AXIS_X), e.getAxisValue(MotionEvent.AXIS_HAT_X));
@@ -6774,6 +7219,14 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             }
             return true;
         }
+        if (slideDurationModalOpen && slideDurationModalState != null) {
+            if (slideDurationModalState.moveFocus(dx, dy)) {
+                persistSlideDurationModalValue();
+                click.move();
+                toastLayer.invalidate();
+            }
+            return true;
+        }
         if (sleepModalOpen && sleepModalState != null) {
             sleepModalState.moveFocus(dx, dy);
             click.move();
@@ -6790,6 +7243,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         }
         if (streamQualityModalOpen && streamQualityModalState != null) {
             drawStreamQualityModal(c);
+            return;
+        }
+        if (slideDurationModalOpen && slideDurationModalState != null) {
+            drawSlideDurationModal(c);
             return;
         }
         if (sleepModalOpen && sleepModalState != null) {
@@ -6991,6 +7448,14 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             }
             return;
         }
+        if (slideDurationModalOpen && slideDurationModalState != null) {
+            if (slideDurationModalState.moveFocus(0, dir)) {
+                persistSlideDurationModalValue();
+                click.move();
+                toastLayer.invalidate();
+            }
+            return;
+        }
         if (sleepModalOpen && sleepModalState != null) {
             sleepModalState.moveFocus(0, dir);
             click.move();
@@ -7052,6 +7517,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             handleStreamQualityModalTap(x, y);
             return;
         }
+        if (slideDurationModalOpen) {
+            handleSlideDurationModalTap(x, y);
+            return;
+        }
         if (sleepModalOpen) {
             handleSleepTimerModalTap(x, y);
             return;
@@ -7102,6 +7571,26 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 shelfIndex = hit;
                 retarget(false);
                 activate();
+                return;
+            }
+        }
+        if (activeScreen == SCREEN_SETTINGS && isCurrentSettingsColumnSearchable()) {
+            int sHit = settingsRenderer.hitTestSettingsSearchBar(x, y);
+            if (sHit == SettingsScreenRenderer.SEARCH_HIT_CLEAR) {
+                zone = Z_CARDS;
+                settingsSearchBarFocused = true;
+                settingsSearchClearFocused = false;
+                updateSettingsSearchQuery("", false);
+                click.move();
+                return;
+            } else if (sHit == SettingsScreenRenderer.SEARCH_HIT_BAR) {
+                zone = Z_CARDS;
+                settingsSearchBarFocused = true;
+                settingsSearchClearFocused = false;
+                showSettingsSearchSoftInput();
+                heroDirty = true;
+                heroLayer.invalidate();
+                click.open();
                 return;
             }
         }
@@ -7173,6 +7662,9 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         }
         if (streamQualityModalOpen) {
             return handleStreamQualityModalKey(e);
+        }
+        if (slideDurationModalOpen) {
+            return handleSlideDurationModalKey(e);
         }
         if (sleepModalOpen) {
             return handleSleepTimerModalKey(e);
@@ -7282,7 +7774,31 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                     backDown = false;
                 }
                 return true;
+            case KeyEvent.KEYCODE_DEL:
+            case KeyEvent.KEYCODE_FORWARD_DEL:
+                if (activeScreen == SCREEN_SETTINGS && zone == Z_CARDS && isCurrentSettingsColumnSearchable()) {
+                    if (down && settingsSearchQuery != null && !settingsSearchQuery.isEmpty()) {
+                        settingsSearchBarFocused = true;
+                        updateSettingsSearchQuery(
+                                settingsSearchQuery.substring(0, settingsSearchQuery.length() - 1), false);
+                        click.move();
+                    }
+                    return true;
+                }
+                return false;
             default:
+                if (down && activeScreen == SCREEN_SETTINGS && zone == Z_CARDS && isCurrentSettingsColumnSearchable()) {
+                    int uch = e.getUnicodeChar();
+                    if (uch >= 32 && uch != 127) {
+                        String cur = settingsSearchQuery != null ? settingsSearchQuery : "";
+                        if (cur.length() < 64) {
+                            settingsSearchBarFocused = true;
+                            updateSettingsSearchQuery(cur + (char) uch, false);
+                            click.move();
+                        }
+                        return true;
+                    }
+                }
                 return false;
         }
     }
@@ -7294,6 +7810,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         }
         if (streamQualityModalOpen) {
             closeStreamQualityModal();
+            return;
+        }
+        if (slideDurationModalOpen) {
+            closeSlideDurationModal();
             return;
         }
         if (sleepModalOpen) {
@@ -7804,6 +8324,8 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             return shelfIndex >= 0 && shelfIndex < shelf.size() && shelf.size() > 1;
         }
         if (activeScreen == SCREEN_SETTINGS && zone == Z_CARDS) {
+            if (settingsSearchBarFocused) return false;
+            if (settingsSearchQuery != null && !settingsSearchQuery.trim().isEmpty()) return false;
             SettingsTree.Node sel = currentSettingsFocusedNode();
             if (sel != null && !sel.grayedOut
                     && (sel.id.startsWith("genre_tv_item:") || sel.id.startsWith("genre_movie_item:"))) {
@@ -8874,7 +9396,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
 
     private boolean stepOverview(long up) {
         if (!running || activeScreen != SCREEN_HOME || !overviewActive || overviewMaxScroll <= 0f
-                || sideShelfOpen || menuOpen || sleepModalOpen || streamQualityModalOpen || syncModalOpen || gameLaunchModalOpen || drawerOpen || sheetOpen) {
+                || sideShelfOpen || menuOpen || sleepModalOpen || slideDurationModalOpen || streamQualityModalOpen || syncModalOpen || gameLaunchModalOpen || drawerOpen || sheetOpen) {
             if (overviewScrollY != 0f) {
                 overviewScrollY = 0f;
                 return true;
@@ -11647,6 +12169,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
 
     private void jumpToSettingsPath(String encodedPath) {
         selectScreen(SCREEN_SETTINGS);
+        clearSettingsSearchState(true);
         settingsPathIds.clear();
         settingsStepDepthStack.clear();
         java.util.Arrays.fill(settingsDepthIndices, 0);
@@ -11705,6 +12228,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     }
 
     private void rebuildSettingsTree() {
+        invalidateSettingsSearchCache();
         settingsRoot = SettingsTree.buildRoot(SettingsTree.captureState(getContext(), data));
         SettingsTree.Node cur = settingsRoot;
         for (int i = 0; i < settingsPathIds.size(); i++) {
@@ -11720,20 +12244,28 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 while (settingsPathIds.size() > i) {
                     settingsPathIds.remove(settingsPathIds.size() - 1);
                 }
+                clearSettingsSearchState(true);
                 break;
             }
             cur = match;
         }
+        boolean searchable = isSettingsColumnSearchable(cur);
+        if (!searchable) {
+            settingsSearchQuery = "";
+            settingsSearchBarFocused = false;
+            settingsSearchClearFocused = false;
+        }
+        List<SettingsTree.Node> displayList = currentSettingsDisplayLeftList(cur);
         int depth = Math.min(settingsPathIds.size(), settingsDepthIndices.length - 1);
-        int leftCount = cur.children.size();
+        int leftCount = displayList.size();
         if (leftCount > 0) {
             int clamped = Math.max(0, Math.min(settingsDepthIndices[depth], leftCount - 1));
-            settingsDepthIndices[depth] = SettingsScreenRenderer.nextSelectableIndex(cur.children, clamped, 0);
+            settingsDepthIndices[depth] = SettingsScreenRenderer.nextSelectableIndex(displayList, clamped, 0);
         } else {
             settingsDepthIndices[depth] = 0;
         }
         SettingsTree.Node leftSel = (leftCount > 0 && settingsDepthIndices[depth] >= 0 && settingsDepthIndices[depth] < leftCount)
-                ? cur.children.get(settingsDepthIndices[depth]) : null;
+                ? displayList.get(settingsDepthIndices[depth]) : null;
         boolean isLastCol = SettingsScreenRenderer.isLastColumnFullWidth(settingsPathIds, cur);
         boolean isPreview = SettingsScreenRenderer.isPreviewColumn(cur);
         if (leftSel == null || !leftSel.hasChildren() || isLastCol || isPreview) {
@@ -11765,14 +12297,18 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
 
     private SettingsTree.Node currentSettingsLeftNode() {
         SettingsTree.Node parent = currentSettingsLeftParent();
-        if (parent == null || parent.children.isEmpty()) return null;
+        List<SettingsTree.Node> list = currentSettingsDisplayLeftList(parent);
+        if (list.isEmpty()) return null;
         int depth = Math.min(settingsPathIds.size(), settingsDepthIndices.length - 1);
-        int idx = SettingsScreenRenderer.nextSelectableIndex(parent.children, settingsDepthIndices[depth], 0);
-        if (idx < 0 || idx >= parent.children.size()) return null;
-        return parent.children.get(idx);
+        int idx = SettingsScreenRenderer.nextSelectableIndex(list, settingsDepthIndices[depth], 0);
+        if (idx < 0 || idx >= list.size()) return null;
+        return list.get(idx);
     }
 
     private SettingsTree.Node currentSettingsFocusedNode() {
+        if (settingsSearchBarFocused && isCurrentSettingsColumnSearchable()) {
+            return null;
+        }
         SettingsTree.Node left = currentSettingsLeftNode();
         if (settingsFocusRight && left != null && left.hasChildren()) {
             int rIdx = SettingsScreenRenderer.nextSelectableIndex(left.children, settingsRightIndex, 0);
@@ -11790,14 +12326,19 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private void drawSettingsScreen(Canvas c) {
         if (settingsRoot == null) rebuildSettingsTree();
         SettingsTree.Node leftParent = currentSettingsLeftParent();
-        List<SettingsTree.Node> leftList = leftParent != null ? leftParent.children : java.util.Collections.emptyList();
+        List<SettingsTree.Node> leftList = currentSettingsDisplayLeftList(leftParent);
         int depth = Math.min(settingsPathIds.size(), settingsDepthIndices.length - 1);
         int leftIdx = leftList.isEmpty() ? 0
                 : SettingsScreenRenderer.nextSelectableIndex(leftList, settingsDepthIndices[depth], 0);
+        boolean searchable = isSettingsColumnSearchable(leftParent);
         settingsRenderer.drawSettingsSplitScreen(
-                getContext(), c, settingsRoot, leftParent, settingsPathIds, leftIdx,
+                getContext(), c, settingsRoot, leftParent, leftList, settingsPathIds, leftIdx,
                 settingsFocusRight, settingsRightIndex, zone == Z_CARDS,
-                reordering && reorderSettingsGenre, k, MARGIN,
+                reordering && reorderSettingsGenre,
+                searchable ? settingsSearchQuery : "",
+                searchable && settingsSearchBarFocused,
+                searchable && settingsSearchBarFocused && settingsSearchClearFocused,
+                k, MARGIN,
                 clockText, dateText, L_INK, L_DIM, WHITE, SHADOW_BLUR,
                 dark() > 0.5f, fill, border, shadow, imagePaint,
                 lCardTitle, lSubTab, lSubTabOn, fitPaint, shadows, tmp,
@@ -11807,12 +12348,65 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private void moveSettings(int dx, int dy) {
         if (settingsRoot == null) rebuildSettingsTree();
         SettingsTree.Node leftParent = currentSettingsLeftParent();
-        List<SettingsTree.Node> leftList = leftParent != null ? leftParent.children : java.util.Collections.emptyList();
+        boolean searchable = isSettingsColumnSearchable(leftParent);
+        List<SettingsTree.Node> leftList = currentSettingsDisplayLeftList(leftParent);
         int depth = Math.min(settingsPathIds.size(), settingsDepthIndices.length - 1);
         int leftIdx = leftList.isEmpty() ? 0
                 : SettingsScreenRenderer.nextSelectableIndex(leftList, settingsDepthIndices[depth], 0);
         SettingsTree.Node hoveredLeft = (leftList.isEmpty() || leftIdx < 0 || leftIdx >= leftList.size())
                 ? null : leftList.get(leftIdx);
+
+        if (searchable && settingsSearchBarFocused) {
+            if (dy < 0) {
+                hideSettingsSearchSoftInput();
+                zone = Z_TOP;
+                topIndex = SCREEN_SETTINGS;
+                retarget(false);
+                heroDirty = true;
+                heroLayer.invalidate();
+                wake();
+                click.move();
+                return;
+            }
+            if (dy > 0) {
+                hideSettingsSearchSoftInput();
+                if (!leftList.isEmpty()) {
+                    settingsSearchBarFocused = false;
+                    settingsSearchClearFocused = false;
+                    settingsDepthIndices[depth] = SettingsScreenRenderer.firstSelectableIndex(leftList);
+                    heroDirty = true;
+                    heroLayer.invalidate();
+                    wake();
+                    click.move();
+                }
+                return;
+            }
+            boolean hasQ = settingsSearchQuery != null && !settingsSearchQuery.trim().isEmpty();
+            if (dx > 0) {
+                if (hasQ && !settingsSearchClearFocused) {
+                    hideSettingsSearchSoftInput();
+                    settingsSearchClearFocused = true;
+                    heroDirty = true;
+                    heroLayer.invalidate();
+                    wake();
+                    click.move();
+                }
+                return;
+            }
+            if (dx < 0) {
+                if (settingsSearchClearFocused) {
+                    settingsSearchClearFocused = false;
+                    heroDirty = true;
+                    heroLayer.invalidate();
+                    wake();
+                    click.move();
+                } else {
+                    backSettings();
+                }
+                return;
+            }
+            return;
+        }
 
         if (dy != 0) {
             if (settingsFocusRight && hoveredLeft != null && hoveredLeft.hasChildren()) {
@@ -11836,8 +12430,17 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 }
                 return;
             }
-            int nextL = SettingsScreenRenderer.nextSelectableIndex(leftList, leftIdx, dy);
+            int nextL = leftList.isEmpty() ? -1 : SettingsScreenRenderer.nextSelectableIndex(leftList, leftIdx, dy);
             if (nextL < 0) {
+                if (searchable) {
+                    settingsSearchBarFocused = true;
+                    settingsSearchClearFocused = false;
+                    heroDirty = true;
+                    heroLayer.invalidate();
+                    wake();
+                    click.move();
+                    return;
+                }
                 zone = Z_TOP;
                 topIndex = SCREEN_SETTINGS;
                 retarget(false);
@@ -11875,7 +12478,21 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private void drillDownSettings(boolean fromOk) {
         if (settingsRoot == null) rebuildSettingsTree();
         SettingsTree.Node leftParent = currentSettingsLeftParent();
-        List<SettingsTree.Node> leftList = leftParent != null ? leftParent.children : java.util.Collections.emptyList();
+        boolean searchable = isSettingsColumnSearchable(leftParent);
+        if (searchable && settingsSearchBarFocused) {
+            if (fromOk) {
+                if (settingsSearchClearFocused) {
+                    settingsSearchClearFocused = false;
+                    updateSettingsSearchQuery("", false);
+                    click.move();
+                } else {
+                    click.open();
+                    showSettingsSearchSoftInput();
+                }
+            }
+            return;
+        }
+        List<SettingsTree.Node> leftList = currentSettingsDisplayLeftList(leftParent);
         if (leftList.isEmpty()) return;
         int depth = Math.min(settingsPathIds.size(), settingsDepthIndices.length - 1);
         int leftIdx = SettingsScreenRenderer.nextSelectableIndex(leftList, settingsDepthIndices[depth], 0);
@@ -11894,6 +12511,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 if (fromOk) applyIntermediateSettingsNodeIfNeeded(rightNode);
                 boolean openAsTerminalOrPreview = !anyGrandchild(rightNode)
                         || SettingsScreenRenderer.isPreviewColumn(rightNode);
+                clearSettingsSearchState(true);
                 if (openAsTerminalOrPreview) {
                     // Push 2 levels so leaf list expands to 100% (or live preview 42%/58%) and Back returns right here
                     settingsPathIds.add(hoveredLeft.id);
@@ -11901,7 +12519,12 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                     settingsDepthIndices[midDepth] = rIdx;
                     settingsPathIds.add(rightNode.id);
                     int leafDepth = Math.min(settingsPathIds.size(), settingsDepthIndices.length - 1);
-                    settingsDepthIndices[leafDepth] = findCheckedOrFirstIndex(rightNode.children);
+                    boolean nextSearchable = SettingsScreenRenderer.isSearchableColumn(rightNode);
+                    settingsDepthIndices[leafDepth] = nextSearchable
+                            ? SettingsScreenRenderer.firstSelectableIndex(rightNode.children)
+                            : findCheckedOrFirstIndex(rightNode.children);
+                    settingsSearchBarFocused = nextSearchable;
+                    settingsSearchClearFocused = false;
                     settingsStepDepthStack.push(2);
                     settingsRightIndex = 0;
                     settingsFocusRight = false;
@@ -11951,9 +12574,15 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             return;
         }
 
+        clearSettingsSearchState(true);
         settingsPathIds.add(hoveredLeft.id);
         int newDepth = Math.min(settingsPathIds.size(), settingsDepthIndices.length - 1);
-        settingsDepthIndices[newDepth] = findCheckedOrFirstIndex(hoveredLeft.children);
+        boolean nextSearchable = SettingsScreenRenderer.isSearchableColumn(hoveredLeft);
+        settingsDepthIndices[newDepth] = nextSearchable
+                ? SettingsScreenRenderer.firstSelectableIndex(hoveredLeft.children)
+                : findCheckedOrFirstIndex(hoveredLeft.children);
+        settingsSearchBarFocused = nextSearchable;
+        settingsSearchClearFocused = false;
         settingsStepDepthStack.push(1);
         settingsRightIndex = 0;
         settingsFocusRight = false;
@@ -11982,6 +12611,15 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     }
 
     private boolean backSettings() {
+        hideSettingsSearchSoftInput();
+        if (isCurrentSettingsColumnSearchable() && settingsSearchQuery != null && !settingsSearchQuery.isEmpty()) {
+            settingsSearchBarFocused = true;
+            settingsSearchClearFocused = false;
+            updateSettingsSearchQuery("", false);
+            click.move();
+            return true;
+        }
+        clearSettingsSearchState(true);
         if (settingsFocusRight) {
             settingsFocusRight = false;
             heroDirty = true;
@@ -12098,81 +12736,28 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 null);
     }
 
-    private void openCloudVaultBackupModal(Context c) {
-        openLiquidGlassInputModal(
-                Ui.tr("Backup Keys to Encrypted Cloud Vault"),
-                Ui.tr("Enter a master passphrase (min 8 chars) to encrypt your keys locally with AES-256-GCM"),
-                Ui.tr("Master passphrase (8+ characters)"),
-                "",
-                true,
-                Ui.tr("Encrypt & Backup"),
-                pass -> {
-                    String trimmed = pass == null ? "" : pass.trim();
-                    if (trimmed.length() < 8) {
-                        showToast(Ui.tr("Vault passphrase must be at least 8 characters"));
-                        return;
-                    }
-                    showToast(Ui.tr("Encrypting and backing up keys to Cloud Vault..."));
-                    final char[] passChars = trimmed.toCharArray();
-                    LOADER.execute(() -> {
-                        try {
-                            Map<String, String> exported = Secrets.exportVaultSecrets(c);
-                            SupabaseClient.get(c).backupVaultSync(passChars, exported);
-                            int count = exported != null ? exported.size() : 0;
-                            handler.post(() -> {
-                                rebuildSettingsTree();
-                                showToast(Ui.tr("Backed up ") + count + Ui.tr(" keys to Encrypted Cloud Vault"));
-                            });
-                        } catch (Exception ex) {
-                            handler.post(() -> showToast(Ui.tr("Vault backup failed: ") + ex.getMessage()));
-                        } finally {
-                            java.util.Arrays.fill(passChars, '\0');
-                        }
-                    });
-                },
-                null);
-    }
-
-    private void openCloudVaultRestoreModal(Context c) {
-        openLiquidGlassInputModal(
-                Ui.tr("Restore Keys from Encrypted Cloud Vault"),
-                Ui.tr("Enter your master passphrase to decrypt and import your private keys"),
-                Ui.tr("Master passphrase"),
-                "",
-                true,
-                Ui.tr("Decrypt & Restore"),
-                pass -> {
-                    String trimmed = pass == null ? "" : pass.trim();
-                    if (trimmed.length() < 8) {
-                        showToast(Ui.tr("Vault passphrase must be at least 8 characters"));
-                        return;
-                    }
-                    showToast(Ui.tr("Restoring keys from Encrypted Cloud Vault..."));
-                    final char[] passChars = trimmed.toCharArray();
-                    LOADER.execute(() -> {
-                        try {
-                            Map<String, String> restored = SupabaseClient.get(c).restoreVaultSync(passChars);
-                            Secrets.importVaultSecrets(c, restored);
-                            int count = restored != null ? restored.size() : 0;
-                            handler.post(() -> {
-                                Prefs.syncRestoredVaultOverrides(restored);
-                                Prefs.reload();
-                                recs.clearRowCache();
-                                recs.refreshIfStale();
-                                reload();
-                                rebuildSettingsTree();
-                                heroDirty = true;
-                                heroLayer.invalidate();
-                                showToast(Ui.tr("Restored ") + count + Ui.tr(" keys from Encrypted Cloud Vault"));
-                            });
-                        } catch (Exception ex) {
-                            handler.post(() -> showToast(Ui.tr("Vault restore failed: ") + ex.getMessage()));
-                        } finally {
-                            java.util.Arrays.fill(passChars, '\0');
-                        }
-                    });
-                },
-                null);
+    private void triggerManualCloudSync(Context c) {
+        if (!CloudSyncManager.get(c).isCloudSyncConfigured()) {
+            showToast(Ui.tr("Link this TV with Setup Studio (Supabase URL, Anon Key & Household Key) first"));
+            return;
+        }
+        showToast(Ui.tr("Syncing Cloud Settings & Encrypted Vault..."));
+        CloudSyncManager.get(c).syncNowAsync("manual", () -> {
+            Prefs.reload();
+            recs.clearRowCache();
+            recs.refreshIfStale();
+            reload();
+            rebuildSettingsTree();
+            layoutLight();
+            statusDirty = true;
+            heroDirty = true;
+            invalidateAll();
+            CloudSyncManager.SyncSummary sum = CloudSyncManager.get(c).getSummary();
+            String msg = (sum.statusText == null || sum.statusText.isEmpty())
+                    ? Ui.tr("Cloud sync complete")
+                    : (Ui.tr("Cloud Sync: ") + sum.statusText);
+            showToast(msg);
+        });
     }
 
     private void executeSettingsNode(SettingsTree.Node node) {
@@ -12251,15 +12836,51 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         } else if ("setup_mark_done".equals(id)) {
             Prefs.setInitialSetupDone(true);
             rebuildSettingsTree();
+            if (settingsPathIds.isEmpty() && settingsRoot != null) {
+                for (int i = 0; i < settingsRoot.children.size(); i++) {
+                    SettingsTree.Node child = settingsRoot.children.get(i);
+                    if (child != null && "initial_setup".equals(child.id)) {
+                        settingsDepthIndices[0] = i;
+                        if (settingsFocusRight && child.hasChildren()) {
+                            int rClamped = Math.max(0, Math.min(settingsRightIndex, child.children.size() - 1));
+                            settingsRightIndex = SettingsScreenRenderer.nextSelectableIndex(child.children, rClamped, 0);
+                        }
+                        break;
+                    }
+                }
+            }
             showToast(Ui.tr("Initial Setup marked as complete"));
         } else if ("setup_google_home".equals(id)) {
             SmartHomeManager.get(c).executeRoutine(activity, "google_home_voice", (ok, msg) -> handler.post(() -> showToast(msg)));
         } else if (id.startsWith("setup_key_")) {
             openApiKeySetupDialog(id);
-        } else if ("vault_backup".equals(id)) {
-            openCloudVaultBackupModal(c);
-        } else if ("vault_restore".equals(id)) {
-            openCloudVaultRestoreModal(c);
+        } else if ("cloud_sync_now".equals(id) || "setup_cloud_sync_now".equals(id)) {
+            triggerManualCloudSync(c);
+        } else if ("stremio_use_household".equals(id)) {
+            boolean next = !Prefs.useHouseholdStremio();
+            Prefs.setUseHouseholdStremio(next);
+            recs.clearRowCache();
+            recs.refreshIfStale();
+            reload();
+            rebuildSettingsTree();
+            showToast(Ui.tr("Household Shared Stremio: ") + (next ? Ui.tr("On") : Ui.tr("Off")));
+        } else if ("tv_override_shelf".equals(id)) {
+            boolean next = !Prefs.isTvOverrideShelfEnabled();
+            Prefs.setTvOverrideShelfEnabled(next);
+            reload();
+            rebuildSettingsTree();
+            showToast(Ui.tr("Favorite Apps Shelf: ") + (next ? Ui.tr("Custom for This TV") : Ui.tr("Synced with Profile")));
+        } else if ("tv_override_hidden_apps".equals(id)) {
+            boolean next = !Prefs.isTvOverrideHiddenAppsEnabled();
+            Prefs.setTvOverrideHiddenAppsEnabled(next);
+            reload();
+            rebuildSettingsTree();
+            showToast(Ui.tr("Hidden Apps: ") + (next ? Ui.tr("Custom for This TV") : Ui.tr("Synced with Profile")));
+        } else if ("tv_override_screensaver".equals(id)) {
+            boolean next = !Prefs.isTvOverrideScreensaverEnabled();
+            Prefs.setTvOverrideScreensaverEnabled(next);
+            rebuildSettingsTree();
+            showToast(Ui.tr("Screensaver: ") + (next ? Ui.tr("Custom for This TV") : Ui.tr("Synced with Profile")));
         } else if (id.startsWith("remote_invite:")) {
             String roleStr = id.substring("remote_invite:".length());
             RemoteAuthManager.Role role = RemoteAuthManager.Role.fromString(roleStr, RemoteAuthManager.Role.GUEST);
@@ -12550,6 +13171,8 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             Prefs.setSaverAnimation(next);
             rebuildSettingsTree();
             showToast(Ui.tr("Image Animations: ") + (next ? Ui.tr("Enabled") : Ui.tr("Disabled")));
+        } else if ("ss_interval".equals(id)) {
+            openSlideDurationModal();
         } else if (id.startsWith("ss_interval:")) {
             try {
                 long ms = Long.parseLong(id.substring("ss_interval:".length()));

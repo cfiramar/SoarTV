@@ -1337,6 +1337,13 @@ var SupabaseService = (function () {
 
   var SELECT_PROFILES = 'id,slug,display_name,avatar_color,trakt_username,is_default,created_at,updated_at';
   var SELECT_WATCHLIST = 'id,profile_id,media_key,imdb_id,kind,title,poster_url,backdrop_url,source_app,deep_link,created_at,updated_at';
+  var SELECT_HOUSEHOLD_SETTINGS = 'id,settings,field_timestamps,updated_at';
+  var SELECT_PROFILE_SETTINGS = 'profile_id,settings,field_timestamps,updated_at';
+  var SELECT_TV_DEVICES = 'device_id,device_name,room_name,platform,brand,model,lan_ip,remote_port,mdns_host,realtime_channel,app_version,tv_settings,field_timestamps,is_active,replaced_by,last_seen_at,updated_at';
+  var SELECT_GAMING_HOSTS = 'host_id,hostname,lan_ip,agent_port,mac_addresses,sunshine_uuid,last_seen_at,updated_at';
+  var SELECT_ENCRYPTED_VAULT = 'vault_id,kdf_algorithm,kdf_salt,kdf_iterations,cipher_iv,ciphertext,key_count,updated_at';
+  var KEY_GAMING_HOSTS = 'soartv.supabase.gaming_hosts';
+  var KEY_TV_DEVICES = 'soartv.supabase.tv_devices';
 
   function loadJson(key, fallback) {
     try { var r = localStorage.getItem(key); return r ? JSON.parse(r) : fallback; } catch (e) { return fallback; }
@@ -1592,22 +1599,138 @@ var SupabaseService = (function () {
       }, 8000, function (err) { if (done) done(err || null); });
   }
 
-  /** Registers this LG/Samsung TV in public.tv_devices for Companion Remote discovery. */
+  function buildMdnsHost(name, devId) {
+    var base = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32);
+    if (!base) base = String(devId || 'tv').toLowerCase().slice(0, 6);
+    if (base.indexOf('soartv-') !== 0) base = 'soartv-' + base;
+    return base + '.local';
+  }
+
+  /** Registers or updates this LG/Samsung TV in public.tv_devices (v2 schema, keyed by permanent device_id). */
   function registerTvDevice(info, done) {
     if (!isConfigured()) { if (done) done(null); return; }
-    var slug = (typeof TV !== 'undefined' && TV.deviceId) ? TV.deviceId() : 'web-tv';
-    var brand = (typeof TV !== 'undefined' && TV.name === 'webos') ? 'LG_WEBOS' :
-                (typeof TV !== 'undefined' && TV.name === 'tizen') ? 'SAMSUNG_TIZEN' : 'WEB';
+    var devId = (typeof TV !== 'undefined' && TV.deviceId) ? TV.deviceId() : 'web-tv';
+    var platform = (typeof TV !== 'undefined' && TV.platformId) ? TV.platformId : 'web';
+    var brand = platform === 'lg-webos' ? 'LG_WEBOS' : (platform === 'samsung-tizen' ? 'SAMSUNG_TIZEN' : 'WEB');
+    var customName = (typeof Prefs !== 'undefined' && Prefs.deviceName) ? Prefs.deviceName() : '';
+    var devName = customName || ((info && info.model) ? ('SoarTV ' + info.model) : ('SoarTV ' + brand));
+    var roomName = (typeof Prefs !== 'undefined' && Prefs.tvRoom) ? Prefs.tvRoom() : 'Living Room';
     var payload = {
-      device_slug: slug,
-      device_name: (info && info.model) ? ('SoarTV ' + info.model) : ('SoarTV ' + brand),
+      device_id: devId,
+      device_name: devName,
+      room_name: roomName,
+      platform: platform,
       brand: brand,
       model: (info && info.model) || brand,
       lan_ip: (info && info.ip) || '',
-      remote_port: 0
+      remote_port: 8484,
+      mdns_host: buildMdnsHost(devName, devId),
+      realtime_channel: channelCode(),
+      app_version: (info && info.version) || '',
+      is_active: true,
+      last_seen_at: new Date().toISOString()
     };
-    SoarTvHttp.request('POST', baseUrl() + '/rest/v1/tv_devices?on_conflict=device_slug',
+    upsertTvDevice(payload, done);
+  }
+
+  function fetchHouseholdSettings(done) {
+    if (!isConfigured()) { if (done) done(null, null); return; }
+    SoarTvHttp.request('GET', baseUrl() + '/rest/v1/household_settings?select=' + SELECT_HOUSEHOLD_SETTINGS + '&id=eq.1&limit=1',
+      buildHeaders(null), null, 8000, function (err, data) {
+        var row = (!err && Array.isArray(data) && data.length) ? data[0] : null;
+        if (done) done(err || null, row);
+      });
+  }
+
+  function upsertHouseholdSettings(settingsObj, timestampsObj, done) {
+    if (!isConfigured()) { if (done) done(null); return; }
+    SoarTvHttp.request('POST', baseUrl() + '/rest/v1/household_settings?on_conflict=id',
+      buildHeaders('resolution=merge-duplicates,return=minimal'), {
+        id: 1,
+        settings: settingsObj || {},
+        field_timestamps: timestampsObj || {}
+      }, 8000, function (err) { if (done) done(err || null); });
+  }
+
+  function fetchProfileSettings(profileId, done) {
+    if (!isConfigured() || !isUuid(profileId)) { if (done) done(null, null); return; }
+    SoarTvHttp.request('GET', baseUrl() + '/rest/v1/user_profile_settings?select=' + SELECT_PROFILE_SETTINGS +
+      '&profile_id=eq.' + encodeURIComponent(profileId) + '&limit=1',
+      buildHeaders(null), null, 8000, function (err, data) {
+        var row = (!err && Array.isArray(data) && data.length) ? data[0] : null;
+        if (done) done(err || null, row);
+      });
+  }
+
+  function upsertProfileSettings(profileId, settingsObj, timestampsObj, done) {
+    if (!isConfigured() || !isUuid(profileId)) { if (done) done(null); return; }
+    SoarTvHttp.request('POST', baseUrl() + '/rest/v1/user_profile_settings?on_conflict=profile_id',
+      buildHeaders('resolution=merge-duplicates,return=minimal'), {
+        profile_id: profileId,
+        settings: settingsObj || {},
+        field_timestamps: timestampsObj || {}
+      }, 8000, function (err) { if (done) done(err || null); });
+  }
+
+  function fetchTvDevices(activeOnly, done) {
+    if (!isConfigured()) { if (done) done(null, loadJson(KEY_TV_DEVICES, [])); return; }
+    var filter = activeOnly ? '&is_active=eq.true' : '';
+    SoarTvHttp.request('GET', baseUrl() + '/rest/v1/tv_devices?select=' + SELECT_TV_DEVICES + filter + '&order=last_seen_at.desc',
+      buildHeaders(null), null, 8000, function (err, data) {
+        if (!err && Array.isArray(data)) saveJson(KEY_TV_DEVICES, data);
+        if (done) done(err || null, loadJson(KEY_TV_DEVICES, []));
+      });
+  }
+
+  function getCachedTvDevices() {
+    return loadJson(KEY_TV_DEVICES, []);
+  }
+
+  function fetchTvDevice(deviceId, done) {
+    if (!isConfigured() || !deviceId) { if (done) done(null, null); return; }
+    SoarTvHttp.request('GET', baseUrl() + '/rest/v1/tv_devices?select=' + SELECT_TV_DEVICES +
+      '&device_id=eq.' + encodeURIComponent(deviceId) + '&limit=1',
+      buildHeaders(null), null, 8000, function (err, data) {
+        var row = (!err && Array.isArray(data) && data.length) ? data[0] : null;
+        if (done) done(err || null, row);
+      });
+  }
+
+  function upsertTvDevice(payload, done) {
+    if (!isConfigured() || !payload || !payload.device_id) { if (done) done(null); return; }
+    SoarTvHttp.request('POST', baseUrl() + '/rest/v1/tv_devices?on_conflict=device_id',
       buildHeaders('resolution=merge-duplicates,return=minimal'), payload, 8000, function (err) {
+        if (done) done(err || null);
+      });
+  }
+
+  function fetchGamingHosts(done) {
+    if (!isConfigured()) { if (done) done(null, loadJson(KEY_GAMING_HOSTS, [])); return; }
+    SoarTvHttp.request('GET', baseUrl() + '/rest/v1/gaming_hosts?select=' + SELECT_GAMING_HOSTS + '&order=last_seen_at.desc',
+      buildHeaders(null), null, 8000, function (err, data) {
+        if (!err && Array.isArray(data)) saveJson(KEY_GAMING_HOSTS, data);
+        if (done) done(err || null, loadJson(KEY_GAMING_HOSTS, []));
+      });
+  }
+
+  function getCachedGamingHosts() {
+    return loadJson(KEY_GAMING_HOSTS, []);
+  }
+
+  function fetchVaultSlot(vaultId, done) {
+    if (!isConfigured() || !vaultId) { if (done) done(null, null); return; }
+    SoarTvHttp.request('GET', baseUrl() + '/rest/v1/encrypted_vault?select=' + SELECT_ENCRYPTED_VAULT +
+      '&vault_id=eq.' + encodeURIComponent(vaultId) + '&limit=1',
+      buildHeaders(null), null, 8000, function (err, data) {
+        var row = (!err && Array.isArray(data) && data.length) ? data[0] : null;
+        if (done) done(err || null, row);
+      });
+  }
+
+  function upsertVaultSlot(envelope, done) {
+    if (!isConfigured() || !envelope || !envelope.vault_id) { if (done) done(null); return; }
+    SoarTvHttp.request('POST', baseUrl() + '/rest/v1/encrypted_vault?on_conflict=vault_id',
+      buildHeaders('resolution=merge-duplicates,return=minimal'), envelope, 8000, function (err) {
         if (done) done(err || null);
       });
   }
@@ -1757,6 +1880,19 @@ var SupabaseService = (function () {
     getCachedVotes: getCachedVotes,
     castVote: castVote,
     registerTvDevice: registerTvDevice,
+    fetchHouseholdSettings: fetchHouseholdSettings,
+    upsertHouseholdSettings: upsertHouseholdSettings,
+    fetchProfileSettings: fetchProfileSettings,
+    upsertProfileSettings: upsertProfileSettings,
+    fetchTvDevices: fetchTvDevices,
+    getCachedTvDevices: getCachedTvDevices,
+    fetchTvDevice: fetchTvDevice,
+    upsertTvDevice: upsertTvDevice,
+    fetchGamingHosts: fetchGamingHosts,
+    getCachedGamingHosts: getCachedGamingHosts,
+    fetchVaultSlot: fetchVaultSlot,
+    upsertVaultSlot: upsertVaultSlot,
+    householdKey: householdKey,
     buildRealtimeUrl: buildRealtimeUrl,
     buildJoinFrame: buildJoinFrame,
     buildBroadcastFrame: buildBroadcastFrame,
@@ -1890,11 +2026,25 @@ var GamingService = (function () {
     return buildTiles(apps, inputs).length > 0;
   }
 
+  /** Resolves the best Gaming PC LAN IP from Prefs or cloud-synced gaming_hosts (IP-change resilient). */
+  function resolvedPcIp() {
+    var hosts = (typeof SupabaseService !== 'undefined' && SupabaseService.getCachedGamingHosts)
+      ? SupabaseService.getCachedGamingHosts() : [];
+    for (var i = 0; i < hosts.length; i++) {
+      if (hosts[i] && hosts[i].lan_ip) return String(hosts[i].lan_ip).replace(/^\s+|\s+$/g, '');
+    }
+    return (typeof Prefs !== 'undefined' && Prefs.gamingPcIp)
+      ? Prefs.gamingPcIp() : ((window.CONFIG && window.CONFIG.gamingPcIp) || '');
+  }
+
   /** Best-effort check of optional SoarTV Laptop Gaming Agent (:8485); never blocks or fails UI. */
   function fetchPcStatus(done) {
-    var ip = (typeof Prefs !== 'undefined' && Prefs.gamingPcIp) ? Prefs.gamingPcIp() : ((window.CONFIG && window.CONFIG.gamingPcIp) || '');
+    var ip = resolvedPcIp();
     if (!ip) { if (done) done(null); return; }
-    SoarTvHttp.request('GET', 'http://' + ip + ':8485/api/gaming/status', {Accept: 'application/json'}, null, 2000, function (err, data) {
+    var hosts = (typeof SupabaseService !== 'undefined' && SupabaseService.getCachedGamingHosts)
+      ? SupabaseService.getCachedGamingHosts() : [];
+    var port = (hosts.length && hosts[0] && hosts[0].agent_port) ? hosts[0].agent_port : 8485;
+    SoarTvHttp.request('GET', 'http://' + ip + ':' + port + '/api/gaming/status', {Accept: 'application/json'}, null, 2000, function (err, data) {
       if (err || !data) { if (done) done(null); return; }
       if (done) done(data);
     });
@@ -1902,8 +2052,490 @@ var GamingService = (function () {
 
   return {
     configuredHdmiKey: configuredHdmiKey,
+    resolvedPcIp: resolvedPcIp,
     buildTiles: buildTiles,
     hasGamingSetup: hasGamingSetup,
     fetchPcStatus: fetchPcStatus
+  };
+})();
+
+/* Cross-Platform Canonical App Registry for LG webOS & Samsung Tizen (parity with CanonicalAppCatalog.java). */
+var CanonicalWebApps = (function () {
+  'use strict';
+
+  var ANDROID_PREFIX = 'pkg:android:';
+  var WEBOS_PREFIX = 'pkg:webos:';
+  var TIZEN_PREFIX = 'pkg:tizen:';
+
+  var SLUG_ALIASES = {
+    stremio: ['com.stremio.webos', 'com.stremio.app', 'com.stremio.tizen'],
+    youtube: ['youtube.leanback.v4', '9Ur5IzDKqV.TizenYouTube', '111299001912'],
+    appletv: ['com.apple.appletv', 'com.samsung.tv.aria-video', '3201807016597'],
+    max: ['com.wbd.stream', 'com.hbo.hbomax', 'NvZ26VG9Yw.HBOGOLAG', '3202301029760'],
+    netflix: ['netflix', 'RN1MCdNq8t.Netflix', 'org.tizen.netflix-app', '11101200001'],
+    prime: ['amazon', 'evKhCgZelL.AmazonIgnitionLauncher2', 'org.tizen.primevideo', '3201512006785'],
+    disney: ['com.disney.disneyplus-prod', '3201901017640'],
+    hulu: ['hulu', '3201601007625'],
+    paramount: ['com.cbs.ott', '3201710014981'],
+    peacock: ['com.peacock.tv', '3202006020991'],
+    globoplay: ['globoplaywebos', 'org.tizen.globoplayapp'],
+    spotify: ['spotify-beehive', 'rJeHak5zRg.Spotify', '3201606009684'],
+    plex: ['cdp-30', '3201512006963'],
+    twitch: ['tv.twitch.tv.starshot.lg', '3202203026841'],
+    crunchyroll: ['com.crunchyroll.webapp', '3201504001965'],
+    jellyfin: ['org.jellyfin.webos', 'AprZAARz4r.Jellyfin'],
+    moonlight: ['com.limelight.webos', 'org.moonlight_stream.moonlight-tv']
+  };
+
+  var ID_TO_SLUG = {};
+  (function () {
+    var slug, list, i;
+    for (slug in SLUG_ALIASES) {
+      if (!Object.prototype.hasOwnProperty.call(SLUG_ALIASES, slug)) continue;
+      list = SLUG_ALIASES[slug];
+      for (i = 0; i < list.length; i++) {
+        ID_TO_SLUG[list[i].toLowerCase()] = slug;
+      }
+    }
+  })();
+
+  function localPrefix(platform) {
+    if (platform === 'samsung-tizen') return TIZEN_PREFIX;
+    return WEBOS_PREFIX;
+  }
+
+  function toCanonical(rawId, platform) {
+    var clean = String(rawId || '').replace(/^\s+|\s+$/g, '');
+    if (!clean) return '';
+    if (clean.indexOf(ANDROID_PREFIX) === 0 || clean.indexOf(WEBOS_PREFIX) === 0 || clean.indexOf(TIZEN_PREFIX) === 0) {
+      return clean;
+    }
+    var lower = clean.toLowerCase();
+    if (ID_TO_SLUG[lower]) return ID_TO_SLUG[lower];
+    if (Object.prototype.hasOwnProperty.call(SLUG_ALIASES, lower)) return lower;
+    return localPrefix(platform) + clean;
+  }
+
+  function toLocalAppId(canonicalEntry, installedIds, platform) {
+    if (!canonicalEntry || !installedIds || !installedIds.length) return null;
+    var entry = String(canonicalEntry).replace(/^\s+|\s+$/g, '');
+    if (!entry) return null;
+    var myPrefix = localPrefix(platform);
+    if (entry.indexOf(ANDROID_PREFIX) === 0) return null;
+    if (entry.indexOf(WEBOS_PREFIX) === 0 && myPrefix !== WEBOS_PREFIX) return null;
+    if (entry.indexOf(TIZEN_PREFIX) === 0 && myPrefix !== TIZEN_PREFIX) return null;
+
+    var lowerMap = {}, i, id;
+    for (i = 0; i < installedIds.length; i++) {
+      id = String(installedIds[i] || '');
+      if (id) lowerMap[id.toLowerCase()] = id;
+    }
+    if (entry.indexOf(myPrefix) === 0) {
+      var raw = entry.slice(myPrefix.length).toLowerCase();
+      return lowerMap[raw] || null;
+    }
+    if (lowerMap[entry.toLowerCase()]) return lowerMap[entry.toLowerCase()];
+    var cands = SLUG_ALIASES[entry.toLowerCase()] || [];
+    for (i = 0; i < cands.length; i++) {
+      if (lowerMap[cands[i].toLowerCase()]) return lowerMap[cands[i].toLowerCase()];
+    }
+    return null;
+  }
+
+  function resolveCanonicalListToLocal(cloudCanonical, installedIds, platform) {
+    var out = [], seen = {}, i, loc;
+    if (!Array.isArray(cloudCanonical) || !Array.isArray(installedIds)) return out;
+    for (i = 0; i < cloudCanonical.length; i++) {
+      loc = toLocalAppId(cloudCanonical[i], installedIds, platform);
+      if (loc && !seen[loc]) { seen[loc] = true; out.push(loc); }
+    }
+    return out;
+  }
+
+  function mergeCanonicalListNonDestructive(existingCloudCanonical, localOrderedIds, installedIds, platform) {
+    var out = [], seen = {}, i, c;
+    if (Array.isArray(localOrderedIds)) {
+      for (i = 0; i < localOrderedIds.length; i++) {
+        c = toCanonical(localOrderedIds[i], platform);
+        if (c && !seen[c]) { seen[c] = true; out.push(c); }
+      }
+    }
+    if (Array.isArray(existingCloudCanonical)) {
+      for (i = 0; i < existingCloudCanonical.length; i++) {
+        c = toCanonical(existingCloudCanonical[i], platform);
+        if (!c || seen[c]) continue;
+        if (!installedIds || toLocalAppId(c, installedIds, platform) === null) {
+          seen[c] = true;
+          out.push(c);
+        }
+      }
+    }
+    return out;
+  }
+
+  return {
+    toCanonical: toCanonical,
+    toLocalAppId: toLocalAppId,
+    resolveCanonicalListToLocal: resolveCanonicalListToLocal,
+    mergeCanonicalListNonDestructive: mergeCanonicalListNonDestructive
+  };
+})();
+
+/* SoarTV v2 3-Tier Cloud Settings & Automatic Household-Key Vault Sync for LG webOS & Samsung Tizen. */
+var CloudSyncService = (function () {
+  'use strict';
+
+  var PUSH_DEBOUNCE_MS = 2500;
+  var PERIODIC_SYNC_MS = 15 * 60000;
+  var KEY_META = 'soartv.cloud.meta';
+  var KEY_TS_PREFIX = 'soartv.cloud.ts.';
+  var KEY_CLOUD_SHELF = 'soartv.cloud.canonical_shelf';
+  var PORTABLE_TV_KEYS = {
+    room_name: true, enable_gaming: true, enable_smarthome: true, enable_reels: true,
+    override_shelf: true, shelf_apps: true, override_hidden_apps: true, hidden_apps: true,
+    override_screensaver: true, screensaver: true, ui_prefs: true
+  };
+
+  var applyingRemote = false;
+  var pushTimer = null;
+  var periodicTimer = null;
+  var dirtyScopes = {};
+  var onAppliedCallback = null;
+
+  function loadJson(key, fallback) {
+    try { var r = localStorage.getItem(key); return r ? JSON.parse(r) : fallback; } catch (e) { return fallback; }
+  }
+  function saveJson(key, val) {
+    try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {}
+  }
+
+  function deepEqual(a, b) {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+
+  /** Deterministic field-level Last-Write-Wins merge matching Android CloudSyncManager.mergeFieldMaps. */
+  function mergeFieldMaps(localVals, localTs, remoteVals, remoteTs) {
+    var lv = localVals || {}, lt = localTs || {}, rv = remoteVals || {}, rt = remoteTs || {};
+    var keys = {}, k;
+    for (k in lv) if (Object.prototype.hasOwnProperty.call(lv, k)) keys[k] = true;
+    for (k in rv) if (Object.prototype.hasOwnProperty.call(rv, k)) keys[k] = true;
+    var mergedVals = {}, mergedTs = {}, localChanged = false, remoteNeedsPush = false;
+    for (k in keys) {
+      if (!Object.prototype.hasOwnProperty.call(keys, k)) continue;
+      var hasL = Object.prototype.hasOwnProperty.call(lv, k);
+      var hasR = Object.prototype.hasOwnProperty.call(rv, k);
+      var tL = typeof lt[k] === 'number' ? lt[k] : 0;
+      var tR = typeof rt[k] === 'number' ? rt[k] : 0;
+      if (hasL && !hasR) {
+        mergedVals[k] = lv[k]; mergedTs[k] = tL > 0 ? tL : 1; remoteNeedsPush = true;
+      } else if (!hasL && hasR) {
+        mergedVals[k] = rv[k]; mergedTs[k] = tR > 0 ? tR : 1; localChanged = true;
+      } else if (tR > tL) {
+        mergedVals[k] = rv[k]; mergedTs[k] = tR;
+        if (!deepEqual(lv[k], rv[k])) localChanged = true;
+      } else if (tL > tR) {
+        mergedVals[k] = lv[k]; mergedTs[k] = tL;
+        if (!deepEqual(lv[k], rv[k])) remoteNeedsPush = true;
+      } else if (tR > 0 && !deepEqual(lv[k], rv[k])) {
+        mergedVals[k] = rv[k]; mergedTs[k] = tR; localChanged = true;
+      } else {
+        mergedVals[k] = lv[k]; mergedTs[k] = tL;
+      }
+    }
+    return {
+      mergedValues: mergedVals,
+      mergedTimestamps: mergedTs,
+      localChanged: localChanged,
+      remoteNeedsPush: remoteNeedsPush
+    };
+  }
+
+  /** Extracts ONLY cross-brand portable per-TV keys (strips hardware-locked HDMI/input mappings). */
+  function extractPortableTvSettings(source) {
+    var out = {}, k;
+    if (!source || typeof source !== 'object') return out;
+    for (k in source) {
+      if (Object.prototype.hasOwnProperty.call(source, k) && PORTABLE_TV_KEYS[k] && source[k] !== undefined && source[k] !== null) {
+        out[k] = source[k];
+      }
+    }
+    return out;
+  }
+
+  function isConfigured() {
+    if (typeof SupabaseService === 'undefined' || !SupabaseService.isConfigured()) return false;
+    var hk = SupabaseService.householdKey ? SupabaseService.householdKey() : '';
+    return hk.length >= 16;
+  }
+
+  function getStatus() {
+    return loadJson(KEY_META, {lastSyncAt: 0, status: 'Not synced yet'});
+  }
+
+  function setStatus(statusText, synced) {
+    var cur = getStatus();
+    cur.status = statusText;
+    if (synced) cur.lastSyncAt = Date.now();
+    saveJson(KEY_META, cur);
+  }
+
+  function tsKey(scope, profileId) {
+    return KEY_TS_PREFIX + scope + (scope === 'profile' && profileId ? ('.' + profileId) : '');
+  }
+
+  function recordLocalChange(scope, fieldKey) {
+    if (applyingRemote || !scope || !fieldKey) return;
+    var prof = SupabaseService.getActiveProfile();
+    var tk = tsKey(scope, prof ? prof.id : '');
+    var ts = loadJson(tk, {});
+    ts[fieldKey] = Date.now();
+    saveJson(tk, ts);
+    dirtyScopes[scope] = true;
+    if (pushTimer) clearTimeout(pushTimer);
+    pushTimer = setTimeout(function () {
+      pushTimer = null;
+      syncNow('debounced_edit');
+    }, PUSH_DEBOUNCE_MS);
+  }
+
+  var PREF_TO_SCOPE = {
+    theme: ['profile', 'theme'],
+    language: ['profile', 'language'],
+    temperature: ['profile', 'temperature_unit'],
+    clockFormat: ['profile', 'clock_format'],
+    hideAnimation: ['profile', 'hide_animation'],
+    servicesOff: ['profile', 'hide_services'],
+    genreOrder_tv: ['profile', 'tv_genres'],
+    genreOrder_movie: ['profile', 'movie_genres'],
+    hiddenGenres_tv: ['profile', 'hidden_tv_genres'],
+    hiddenGenres_movie: ['profile', 'hidden_movie_genres'],
+    useHouseholdStremio: ['profile', 'use_household_stremio'],
+    shelf: ['profile', 'shelf_apps'],
+    saver: ['profile', 'screensaver'],
+    saverWatch: ['profile', 'screensaver'],
+    city: ['household', 'city'],
+    wizSeedIps: ['household', 'wiz_seed_ips'],
+    gamingMode: ['tv', 'enable_gaming'],
+    smartHomeMode: ['tv', 'enable_smarthome'],
+    tvRoom: ['tv', 'room_name'],
+    tvOverrideShelf: ['tv', 'override_shelf'],
+    tvShelfOverride: ['tv', 'shelf_apps'],
+    tvOverrideHiddenApps: ['tv', 'override_hidden_apps'],
+    tvOverrideScreensaver: ['tv', 'override_screensaver']
+  };
+
+  function handlePrefMutation(prefName) {
+    if (applyingRemote || !prefName) return;
+    var mapping = PREF_TO_SCOPE[prefName];
+    if (mapping) {
+      if ((prefName === 'saver' || prefName === 'saverWatch') && typeof Prefs !== 'undefined' && Prefs.tvOverrideScreensaver()) {
+        recordLocalChange('tv', 'screensaver');
+      } else {
+        recordLocalChange(mapping[0], mapping[1]);
+      }
+      return;
+    }
+    var secretPrefs = {
+      tmdbKey: 'household', omdbKey: 'household', mdblistKey: 'household', geminiKey: 'household',
+      traktClientId: 'household', sensiboKey: 'household', tuyaAccessId: 'household', tuyaAccessSecret: 'household'
+    };
+    if (secretPrefs[prefName]) {
+      recordLocalChange('household', '_vault_' + prefName);
+    }
+  }
+
+  function exportLocalProfileSettings(installedAppIds) {
+    if (typeof Prefs === 'undefined') return {};
+    var platform = (typeof TV !== 'undefined' && TV.platformId) ? TV.platformId : 'web';
+    var prevCloudShelf = loadJson(KEY_CLOUD_SHELF, []);
+    var shelfLocal = Prefs.profileShelf() || [];
+    var out = {
+      theme: Prefs.theme(),
+      language: Prefs.language(),
+      temperature_unit: Prefs.temperature(),
+      clock_format: Prefs.clockFormat(),
+      hide_animation: Prefs.hideAnimation(),
+      use_household_stremio: Prefs.useHouseholdStremio(),
+      tv_genres: Prefs.genreOrder('tv') || [],
+      movie_genres: Prefs.genreOrder('movie') || [],
+      hidden_tv_genres: Prefs.hiddenGenres('tv'),
+      hidden_movie_genres: Prefs.hiddenGenres('movie')
+    };
+    if (shelfLocal.length) {
+      out.shelf_apps = CanonicalWebApps.mergeCanonicalListNonDestructive(prevCloudShelf, shelfLocal, installedAppIds, platform);
+    }
+    return out;
+  }
+
+  function applyRemoteProfileSettings(merged, installedAppIds) {
+    if (typeof Prefs === 'undefined' || !merged) return;
+    applyingRemote = true;
+    try {
+      if (merged.theme) Prefs.setSilent('theme', String(merged.theme));
+      if (merged.language) Prefs.setSilent('language', String(merged.language));
+      if (merged.temperature_unit) Prefs.setSilent('temperature', String(merged.temperature_unit));
+      if (merged.clock_format) Prefs.setSilent('clockFormat', String(merged.clock_format));
+      if (typeof merged.hide_animation === 'boolean') Prefs.setSilent('hideAnimation', merged.hide_animation);
+      if (typeof merged.use_household_stremio === 'boolean') Prefs.setSilent('useHouseholdStremio', merged.use_household_stremio);
+      if (Array.isArray(merged.tv_genres) && merged.tv_genres.length) Prefs.setSilent('genreOrder_tv', merged.tv_genres);
+      if (Array.isArray(merged.movie_genres) && merged.movie_genres.length) Prefs.setSilent('genreOrder_movie', merged.movie_genres);
+      if (Array.isArray(merged.hidden_tv_genres)) Prefs.setSilent('hiddenGenres_tv', merged.hidden_tv_genres);
+      if (Array.isArray(merged.hidden_movie_genres)) Prefs.setSilent('hiddenGenres_movie', merged.hidden_movie_genres);
+      if (Array.isArray(merged.shelf_apps) && merged.shelf_apps.length) {
+        saveJson(KEY_CLOUD_SHELF, merged.shelf_apps);
+        if (installedAppIds && installedAppIds.length) {
+          var platform = (typeof TV !== 'undefined' && TV.platformId) ? TV.platformId : 'web';
+          var resolved = CanonicalWebApps.resolveCanonicalListToLocal(merged.shelf_apps, installedAppIds, platform);
+          if (resolved.length) Prefs.setSilent('shelf', resolved);
+        }
+      }
+    } finally {
+      applyingRemote = false;
+    }
+  }
+
+  function exportLocalHouseholdSecrets() {
+    var out = {};
+    if (typeof Prefs === 'undefined') return out;
+    var map = [
+      ['tmdb_key', Prefs.tmdbKey()],
+      ['omdb_key', Prefs.omdbKey()],
+      ['mdblist_key', Prefs.mdblistKey()],
+      ['gemini_api_key', Prefs.geminiKey()],
+      ['trakt_client_id', Prefs.traktClientId()],
+      ['sensibo_api_key', Prefs.sensiboKey()],
+      ['tuya_access_id', Prefs.tuyaAccessId()],
+      ['tuya_access_secret', Prefs.tuyaAccessSecret()]
+    ];
+    for (var i = 0; i < map.length; i++) {
+      if (map[i][1]) out[map[i][0]] = map[i][1];
+    }
+    return out;
+  }
+
+  function importHouseholdSecrets(sec) {
+    if (!sec || typeof Prefs === 'undefined') return false;
+    var changed = false;
+    var pairs = [
+      ['tmdb_key', 'tmdbKey'],
+      ['omdb_key', 'omdbKey'],
+      ['mdblist_key', 'mdblistKey'],
+      ['gemini_api_key', 'geminiKey'],
+      ['trakt_client_id', 'traktClientId'],
+      ['sensibo_api_key', 'sensiboKey'],
+      ['tuya_access_id', 'tuyaAccessId'],
+      ['tuya_access_secret', 'tuyaAccessSecret']
+    ];
+    applyingRemote = true;
+    try {
+      for (var i = 0; i < pairs.length; i++) {
+        var val = sec[pairs[i][0]];
+        if (val && typeof val === 'string' && val.replace(/^\s+|\s+$/g, '')) {
+          Prefs.setSilent(pairs[i][1], val.replace(/^\s+|\s+$/g, ''));
+          changed = true;
+        }
+      }
+    } finally {
+      applyingRemote = false;
+    }
+    return changed;
+  }
+
+  /** Runs a full 3-tier v2 pull + field-level LWW merge + automatic Household-Key E2EE vault sync. */
+  function syncNow(reason, done, installedAppIds) {
+    if (!isConfigured()) {
+      setStatus('Local mode (Supabase not linked)', false);
+      if (done) done(null, false);
+      return;
+    }
+    var pass = SoarTvCrypto.deriveHouseholdVaultPassphrase(SupabaseService.householdKey());
+    var prof = SupabaseService.getActiveProfile();
+    var anyChange = false;
+
+    // Step 1: Household E2EE Vault
+    SupabaseService.fetchVaultSlot(SoarTvCrypto.HOUSEHOLD_VAULT_ID, function (vErr, envRow) {
+      var localSec = exportLocalHouseholdSecrets();
+      var remoteSec = {};
+      if (!vErr && envRow && envRow.ciphertext) {
+        try { remoteSec = SoarTvCrypto.decryptVaultMap(envRow, pass); } catch (e) {}
+      }
+      var mergedSec = {}, k, needPushVault = false;
+      for (k in remoteSec) if (Object.prototype.hasOwnProperty.call(remoteSec, k)) mergedSec[k] = remoteSec[k];
+      for (k in localSec) {
+        if (!Object.prototype.hasOwnProperty.call(localSec, k)) continue;
+        if (!mergedSec[k] || dirtyScopes.household) {
+          if (mergedSec[k] !== localSec[k]) needPushVault = true;
+          mergedSec[k] = localSec[k];
+        }
+      }
+      if (importHouseholdSecrets(mergedSec)) anyChange = true;
+
+      function afterVaultPush() {
+        // Step 2: Profile Settings LWW merge
+        var profId = prof ? prof.id : '';
+        SupabaseService.fetchProfileSettings(profId, function (pErr, pRow) {
+          var localProf = exportLocalProfileSettings(installedAppIds);
+          var localTs = loadJson(tsKey('profile', profId), {});
+          var remoteProf = (!pErr && pRow && pRow.settings) ? pRow.settings : {};
+          var remoteTs = (!pErr && pRow && pRow.field_timestamps) ? pRow.field_timestamps : {};
+          var m = mergeFieldMaps(localProf, localTs, remoteProf, remoteTs);
+          saveJson(tsKey('profile', profId), m.mergedTimestamps);
+          if (m.localChanged) {
+            applyRemoteProfileSettings(m.mergedValues, installedAppIds);
+            anyChange = true;
+          }
+          function afterProfPush() {
+            // Step 3: Gaming Hosts & Household TV Directory refresh
+            SupabaseService.fetchGamingHosts(function () {
+              SupabaseService.fetchTvDevices(true, function () {
+                dirtyScopes = {};
+                setStatus('Synced (' + (reason || 'auto') + ')', true);
+                if (anyChange && onAppliedCallback) onAppliedCallback();
+                if (done) done(null, anyChange);
+              });
+            });
+          }
+          if (m.remoteNeedsPush || dirtyScopes.profile) {
+            SupabaseService.upsertProfileSettings(profId, m.mergedValues, m.mergedTimestamps, afterProfPush);
+          } else {
+            afterProfPush();
+          }
+        });
+      }
+
+      if (needPushVault && Object.keys(mergedSec).length > 0) {
+        var newEnv = SoarTvCrypto.encryptVaultMap(SoarTvCrypto.HOUSEHOLD_VAULT_ID, mergedSec, pass);
+        SupabaseService.upsertVaultSlot(newEnv, afterVaultPush);
+      } else {
+        afterVaultPush();
+      }
+    });
+  }
+
+  function startPeriodic() {
+    if (periodicTimer) clearInterval(periodicTimer);
+    periodicTimer = setInterval(function () {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      syncNow('periodic');
+    }, PERIODIC_SYNC_MS);
+  }
+
+  function stopPeriodic() {
+    if (periodicTimer) { clearInterval(periodicTimer); periodicTimer = null; }
+  }
+
+  return {
+    PUSH_DEBOUNCE_MS: PUSH_DEBOUNCE_MS,
+    PERIODIC_SYNC_MS: PERIODIC_SYNC_MS,
+    isConfigured: isConfigured,
+    getStatus: getStatus,
+    mergeFieldMaps: mergeFieldMaps,
+    extractPortableTvSettings: extractPortableTvSettings,
+    recordLocalChange: recordLocalChange,
+    handlePrefMutation: handlePrefMutation,
+    syncNow: syncNow,
+    startPeriodic: startPeriodic,
+    stopPeriodic: stopPeriodic,
+    setOnApplied: function (cb) { onAppliedCallback = cb; }
   };
 })();

@@ -439,6 +439,59 @@ public final class ControllerManager {
             ed.putString(KEY_PREFIX_HWNAME + key, hardwareDeviceName.trim());
         }
         ed.apply();
+        if (key.startsWith("bt:")) {
+            try {
+                CloudSyncManager.get(context).recordLocalFieldChange(
+                        CloudSyncManager.Scope.HOUSEHOLD, "bt_controller_tags");
+            } catch (RuntimeException ignored) {
+            }
+        }
+    }
+
+    /**
+     * Exports all tagged Bluetooth gamepad names and colors ({@code bt:<mac>}) for Household Cloud Sync.
+     * Per-TV physical USB port tags ({@code usbport:*}) are intentionally excluded.
+     */
+    public static Map<String, Object> exportBluetoothTagsForCloud(Context context) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        if (context == null) return out;
+        SharedPreferences sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        Map<String, ?> all = sp.getAll();
+        if (all == null) return out;
+        for (Map.Entry<String, ?> e : all.entrySet()) {
+            String k = e.getKey();
+            if (k != null && k.startsWith(KEY_PREFIX_TAGGED + "bt:") && Boolean.TRUE.equals(e.getValue())) {
+                String desc = k.substring(KEY_PREFIX_TAGGED.length());
+                Map<String, Object> tag = new LinkedHashMap<>();
+                tag.put("name", sp.getString(KEY_PREFIX_NAME + desc, ""));
+                tag.put("color", sp.getInt(KEY_PREFIX_COLOR + desc, COLOR_NEUTRAL_FALLBACK));
+                String hw = sp.getString(KEY_PREFIX_HWNAME + desc, "");
+                if (!hw.isEmpty()) tag.put("hw_name", hw);
+                out.put(desc, tag);
+            }
+        }
+        return out;
+    }
+
+    /** Imports household-synced Bluetooth gamepad names and colors ({@code bt:<mac>}) locally. */
+    public static void importBluetoothTagsFromCloud(Context context, Map<String, Object> tags) {
+        if (context == null || tags == null || tags.isEmpty()) return;
+        SharedPreferences sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        SharedPreferences.Editor ed = sp.edit();
+        for (Map.Entry<String, Object> e : tags.entrySet()) {
+            String desc = e.getKey();
+            if (desc == null || !desc.startsWith("bt:")) continue;
+            Map<String, Object> tag = CloudVaultCrypto.JsonCodec.optObjectMap(tags, desc);
+            if (tag.isEmpty()) continue;
+            String name = CloudVaultCrypto.JsonCodec.optString(tag, "name", "");
+            int color = CloudVaultCrypto.JsonCodec.optInt(tag, "color", COLOR_NEUTRAL_FALLBACK);
+            String hw = CloudVaultCrypto.JsonCodec.optString(tag, "hw_name", "");
+            ed.putString(KEY_PREFIX_NAME + desc, name);
+            ed.putInt(KEY_PREFIX_COLOR + desc, color);
+            ed.putBoolean(KEY_PREFIX_TAGGED + desc, true);
+            if (!hw.isEmpty()) ed.putString(KEY_PREFIX_HWNAME + desc, hw);
+        }
+        ed.apply();
     }
 
     /**

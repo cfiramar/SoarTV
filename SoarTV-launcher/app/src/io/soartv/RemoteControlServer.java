@@ -144,10 +144,18 @@ public final class RemoteControlServer {
         acceptThread.setDaemon(true);
         acceptThread.start();
 
+        TvDeviceIdentity identity = TvDeviceIdentity.get(appContext);
+        identity.setIpChangeListener((newIp, oldIp) ->
+                CloudSyncManager.get(appContext).reportLanIpChangedAsync(newIp));
+        identity.startServices(port);
+
         InetAddress lan = lanAddress(appContext);
-        String ip = lan != null ? lan.getHostAddress() : "";
-        String deviceId = "soartv-" + TvDeviceProfile.current().getModel().toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
-        SupabaseClient.get(appContext).registerTvDeviceAsync(deviceId, TvDeviceProfile.current().getModel(), ip, port);
+        String ip = lan != null ? lan.getHostAddress() : identity.getLastKnownLanIp();
+        SupabaseClient.get(appContext).registerTvDeviceAsync(
+                identity.getDeviceId(),
+                identity.getDeviceName(),
+                ip,
+                port);
     }
 
     /** Detaches the UI host when the launcher pauses (server stays alive in `:home` for instant wake). */

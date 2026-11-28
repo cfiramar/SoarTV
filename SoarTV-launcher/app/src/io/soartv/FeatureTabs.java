@@ -89,6 +89,13 @@ public final class FeatureTabs {
     /** Updates the user's runtime override mode for the Gaming tab on the TV. */
     public static void setGamingModePref(String mode) {
         Prefs.setRawFeatureMode(PREF_GAMING_MODE, normalizeMode(mode));
+        if (Prefs.context() != null) {
+            try {
+                CloudSyncManager.get(Prefs.context()).recordLocalFieldChange(
+                        CloudSyncManager.Scope.TV_DEVICE, "enable_gaming");
+            } catch (RuntimeException ignored) {
+            }
+        }
     }
 
     /** Returns the user's runtime override mode for the Smart Home tab ({@code "auto"}, {@code "true"}, or {@code "false"}). */
@@ -116,6 +123,13 @@ public final class FeatureTabs {
     /** Updates the user's runtime override mode for the Smart Home tab on the TV. */
     public static void setSmartHomeModePref(String mode) {
         Prefs.setRawFeatureMode(PREF_SMARTHOME_MODE, normalizeMode(mode));
+        if (Prefs.context() != null) {
+            try {
+                CloudSyncManager.get(Prefs.context()).recordLocalFieldChange(
+                        CloudSyncManager.Scope.TV_DEVICE, "enable_smarthome");
+            } catch (RuntimeException ignored) {
+            }
+        }
     }
 
     /** Returns {@code true} when any PC gaming host, MAC, or pairing token is configured. */

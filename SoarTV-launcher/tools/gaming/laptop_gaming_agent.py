@@ -7899,8 +7899,13 @@ class TvBeaconNotifier:
             addr = addr.ipv4_mapped
         return bool(addr.is_loopback or addr.is_unspecified or addr.is_multicast)
 
-    def record_authenticated_tv(self, client_ip: str, tv_port_header: Optional[str] = None) -> None:
-        """Persists the authenticated TV's LAN IPv4/IPv6 address and RemoteControlServer port."""
+    def record_authenticated_tv(
+        self,
+        client_ip: str,
+        tv_port_header: Optional[str] = None,
+        tv_id_header: Optional[str] = None,
+    ) -> None:
+        """Persists an authenticated TV's LAN IPv4/IPv6 address and port (supports multiple household TVs)."""
         clean_ip = (client_ip or "").strip()
         if not clean_ip or clean_ip.lower() == "unknown":
             return
@@ -7930,8 +7935,36 @@ class TvBeaconNotifier:
                     port = parsed_p
             except ValueError:
                 pass
-        payload = {"tvIp": clean_ip, "tvPort": port, "updatedAt": time.time()}
+        tv_key = (tv_id_header or "").strip() or f"{clean_ip}:{port}"
+        now_ts = time.time()
         with self._lock:
+            tvs_map: Dict[str, Dict[str, Any]] = {}
+            try:
+                if self._path.is_file():
+                    prev = json.loads(self._path.read_text(encoding="utf-8"))
+                    if isinstance(prev, dict):
+                        if isinstance(prev.get("tvs"), dict):
+                            for k, entry in prev["tvs"].items():
+                                if isinstance(entry, dict) and entry.get("tvIp"):
+                                    tvs_map[str(k)] = dict(entry)
+                        elif prev.get("tvIp"):
+                            old_ip = str(prev.get("tvIp", "")).strip()
+                            old_port = int(prev.get("tvPort", self._default_tv_port))
+                            if old_ip:
+                                tvs_map[f"{old_ip}:{old_port}"] = {
+                                    "tvIp": old_ip,
+                                    "tvPort": old_port,
+                                    "updatedAt": float(prev.get("updatedAt", now_ts)),
+                                }
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+            tvs_map[tv_key] = {"tvIp": clean_ip, "tvPort": port, "updatedAt": now_ts}
+            payload = {
+                "tvIp": clean_ip,
+                "tvPort": port,
+                "updatedAt": now_ts,
+                "tvs": tvs_map,
+            }
             try:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 self._path.write_text(json.dumps(payload), encoding="utf-8")
@@ -7953,12 +7986,99 @@ class TvBeaconNotifier:
                 return None
         return None
 
-    def notify_ip_changed(self, current_pc_ip: str, agent_port: int = DEFAULT_AGENT_PORT) -> bool:
-        """Sends POST /api/gaming/pc-announce to the saved TV endpoint when the PC boots or changes IP."""
-        endpoint = self.load_saved_tv_endpoint()
-        if endpoint is None:
+    def load_all_saved_tv_endpoints(self) -> List[Tuple[str, int]]:
+        """Loads every unique saved household (tv_ip, tv_port) endpoint (multi-TV support)."""
+        out: List[Tuple[str, int]] = []
+        seen: Set[Tuple[str, int]] = set()
+        with self._lock:
+            try:
+                if not self._path.is_file():
+                    return []
+                raw = json.loads(self._path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    tvs_map = raw.get("tvs")
+                    if isinstance(tvs_map, dict):
+                        for entry in tvs_map.values():
+                            if not isinstance(entry, dict):
+                                continue
+                            ip = str(entry.get("tvIp", "")).strip()
+                            port = int(entry.get("tvPort", self._default_tv_port))
+                            if ip and 1 <= port <= 65535 and (ip, port) not in seen:
+                                seen.add((ip, port))
+                                out.append((ip, port))
+                    top_ip = str(raw.get("tvIp", "")).strip()
+                    top_port = int(raw.get("tvPort", self._default_tv_port))
+                    if top_ip and 1 <= top_port <= 65535 and (top_ip, top_port) not in seen:
+                        seen.add((top_ip, top_port))
+                        out.append((top_ip, top_port))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                return []
+        return out
+
+    @staticmethod
+    def discover_lan_tvs_udp(tv_port: int = DEFAULT_TV_REMOTE_PORT, timeout_sec: float = 0.25) -> List[Tuple[str, int]]:
+        """Broadcasts SOARTV_TV_DISCOVER_V1 on UDP 8484 to locate household TVs even after simultaneous DHCP IP changes."""
+        found: List[Tuple[str, int]] = []
+        seen: Set[Tuple[str, int]] = set()
+        probe = json.dumps({"op": "SOARTV_TV_DISCOVER_V1"}).encode("utf-8")
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.settimeout(min(0.15, max(0.05, timeout_sec)))
+                sock.sendto(probe, ("255.255.255.255", tv_port))
+                deadline = time.monotonic() + max(0.08, timeout_sec)
+                while time.monotonic() < deadline:
+                    try:
+                        data, addr = sock.recvfrom(1024)
+                    except socket.timeout:
+                        break
+                    try:
+                        msg = json.loads(data.decode("utf-8", errors="ignore"))
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(msg, dict) and msg.get("op") == "SOARTV_TV_HERE_V1":
+                        lan_ip = str(msg.get("lanIp") or addr[0]).strip()
+                        port = int(msg.get("port") or tv_port)
+                        if lan_ip and 1 <= port <= 65535 and (lan_ip, port) not in seen:
+                            seen.add((lan_ip, port))
+                            found.append((lan_ip, port))
+        except OSError:
+            pass
+        return found
+
+    @staticmethod
+    def broadcast_udp_announce(current_pc_ip: str, agent_port: int = DEFAULT_AGENT_PORT) -> bool:
+        """Emits a zero-secret LAN UDP presence packet so nearby TVs learn the PC's new IP immediately."""
+        payload = json.dumps(
+            {
+                "op": "SOARTV_GAMING_HERE_V1",
+                "agentService": AGENT_SERVICE_ID,
+                "agentPort": agent_port,
+                "pcIp": current_pc_ip or "",
+            }
+        ).encode("utf-8")
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.sendto(payload, ("255.255.255.255", agent_port))
+                return True
+        except OSError:
             return False
-        tv_ip, tv_port = endpoint
+
+    def notify_ip_changed(
+        self,
+        current_pc_ip: str,
+        agent_port: int = DEFAULT_AGENT_PORT,
+        discover_udp: bool = False,
+    ) -> bool:
+        """Sends POST /api/gaming/pc-announce to every saved household TV (and optional UDP-discovered TVs)."""
+        endpoints = self.load_all_saved_tv_endpoints()
+        if discover_udp:
+            for ep in self.discover_lan_tvs_udp(tv_port=self._default_tv_port):
+                if ep not in endpoints:
+                    endpoints.append(ep)
+        if not endpoints:
+            return False
         body = json.dumps(
             {
                 "agentService": AGENT_SERVICE_ID,
@@ -7966,29 +8086,185 @@ class TvBeaconNotifier:
                 "pcIp": current_pc_ip or "",
             }
         ).encode("utf-8")
-        req = urllib.request.Request(
-            f"http://{tv_ip}:{tv_port}/api/gaming/pc-announce",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=1.5) as resp:
-                if 200 <= resp.status < 300:
-                    self._last_announced_pc_ip = current_pc_ip
-                    return True
-        except Exception as exc:
-            AgentLogger.debug("TV pc-announce skipped (%s:%d): %s", tv_ip, tv_port, type(exc).__name__)
-        return False
+        any_ok = False
+        for tv_ip, tv_port in endpoints:
+            req = urllib.request.Request(
+                f"http://{tv_ip}:{tv_port}/api/gaming/pc-announce",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    if 200 <= resp.status < 300:
+                        any_ok = True
+            except Exception as exc:
+                AgentLogger.debug("TV pc-announce skipped (%s:%d): %s", tv_ip, tv_port, type(exc).__name__)
+        if any_ok:
+            self._last_announced_pc_ip = current_pc_ip
+        return any_ok
 
     def check_and_notify_if_ip_changed(self, agent_port: int = DEFAULT_AGENT_PORT) -> None:
-        """Checks the PC's primary LAN IPv4 and notifies the TV whenever it changes."""
+        """Checks the PC's primary LAN IPv4 and notifies all household TVs + LAN UDP whenever it changes."""
         now_ip = LocalNetworkInspector.get_primary_lan_ipv4()
         if now_ip and now_ip != self._last_announced_pc_ip:
-            if not self.notify_ip_changed(now_ip, agent_port=agent_port):
+            self.broadcast_udp_announce(now_ip, agent_port=agent_port)
+            if not self.notify_ip_changed(now_ip, agent_port=agent_port, discover_udp=True):
                 # Still record locally after one attempt so offline TVs aren't polled every 2s,
                 # while re-notifying immediately if Wi-Fi drops and assigns yet another IP.
                 self._last_announced_pc_ip = now_ip
+
+
+class SupabaseHostReporter:
+    """
+    Optional zero-dependency cloud rendezvous reporter for `public.gaming_hosts` (SoarTV v2 IP resilience).
+
+    Why: If the Gaming PC and every TV in the household change routers, subnets, or DHCP leases at the
+    same time (or if a TV is on LG webOS / Samsung Tizen without raw LAN UDP sockets), upserting the
+    PC's live LAN IP + NIC MAC addresses into Supabase `gaming_hosts` lets every household TV locate
+    and wake the PC automatically. Silently no-ops when Supabase credentials are absent or offline.
+    What: Loads optional `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `HOUSEHOLD_KEY` from env / `.env` /
+    `config.properties` and upserts `POST /rest/v1/gaming_hosts?on_conflict=host_id` on boot & IP change.
+    """
+
+    def __init__(
+        self,
+        supabase_url: Optional[str] = None,
+        supabase_anon_key: Optional[str] = None,
+        household_key: Optional[str] = None,
+        repo_root: Optional[Path] = None,
+    ) -> None:
+        self._repo_root = repo_root or Path(__file__).resolve().parents[3]
+        self._explicit_url = supabase_url
+        self._explicit_anon = supabase_anon_key
+        self._explicit_hh = household_key
+        self._last_reported_ip: str = ""
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _read_kv_file(path: Path) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        try:
+            if not path.is_file():
+                return out
+            for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                ck = k.strip()
+                cv = v.strip().strip('"').strip("'")
+                if ck and cv:
+                    out[ck] = cv
+        except OSError:
+            pass
+        return out
+
+    def resolve_credentials(self) -> Tuple[str, str, str]:
+        """Returns `(supabase_url, supabase_anon_key, household_key)` from explicit args, env, or local config."""
+        url = (self._explicit_url or os.environ.get("SUPABASE_URL", "")).strip()
+        anon = (self._explicit_anon or os.environ.get("SUPABASE_ANON_KEY", "")).strip()
+        hh = (self._explicit_hh or os.environ.get("HOUSEHOLD_KEY", "")).strip()
+        if not (url and anon and hh):
+            env_map = self._read_kv_file(self._repo_root / ".env")
+            cfg_map = self._read_kv_file(self._repo_root / "SoarTV-launcher" / "config.properties")
+            url = url or env_map.get("SUPABASE_URL", "") or cfg_map.get("supabase_url", "")
+            anon = anon or env_map.get("SUPABASE_ANON_KEY", "") or cfg_map.get("supabase_anon_key", "")
+            hh = hh or env_map.get("HOUSEHOLD_KEY", "") or cfg_map.get("household_key", "")
+        return (url.strip().rstrip("/"), anon.strip(), hh.strip())
+
+    def is_configured(self) -> bool:
+        url, anon, hh = self.resolve_credentials()
+        return bool(url and anon and len(hh) >= 16)
+
+    @staticmethod
+    def compute_host_id(sunshine_uuid: str = "", hostname: str = "") -> str:
+        """Builds a deterministic host_id anchored to Sunshine UUID or sanitized hostname."""
+        clean_uuid = (sunshine_uuid or "").strip().lower()
+        if clean_uuid:
+            return f"sunshine-{clean_uuid}"
+        clean_host = re.sub(r"[^a-z0-9_-]+", "-", (hostname or socket.gethostname() or "gaming-pc").strip().lower()).strip("-")
+        return f"pc-{clean_host or 'gaming'}"
+
+    def build_host_payload(
+        self,
+        lan_ip: str,
+        agent_port: int = DEFAULT_AGENT_PORT,
+        mac_addresses: Optional[Sequence[str]] = None,
+        sunshine_uuid: Optional[str] = None,
+        hostname: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Builds the canonical `public.gaming_hosts` upsert JSON payload."""
+        s_uuid = sunshine_uuid if sunshine_uuid is not None else (SunshineConfigManager.read_host_uuid() or "")
+        host_name = (hostname or socket.gethostname() or "Gaming-PC").strip()
+        macs = list(mac_addresses) if mac_addresses is not None else LocalNetworkInspector.get_local_mac_addresses()
+        return {
+            "host_id": self.compute_host_id(s_uuid, host_name),
+            "hostname": host_name,
+            "lan_ip": (lan_ip or "").strip(),
+            "agent_port": int(agent_port),
+            "mac_addresses": macs,
+            "sunshine_uuid": s_uuid,
+            "last_seen_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+
+    def report_host(
+        self,
+        lan_ip: str,
+        agent_port: int = DEFAULT_AGENT_PORT,
+        mac_addresses: Optional[Sequence[str]] = None,
+        sunshine_uuid: Optional[str] = None,
+        hostname: Optional[str] = None,
+    ) -> bool:
+        """Upserts this Gaming PC's live LAN IP and MACs to Supabase `public.gaming_hosts`."""
+        if not lan_ip or not self.is_configured():
+            return False
+        url, anon, hh = self.resolve_credentials()
+        payload = self.build_host_payload(
+            lan_ip=lan_ip,
+            agent_port=agent_port,
+            mac_addresses=mac_addresses,
+            sunshine_uuid=sunshine_uuid,
+            hostname=hostname,
+        )
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{url}/rest/v1/gaming_hosts?on_conflict=host_id",
+            data=body,
+            headers={
+                "Content-Type": "application/json; charset=UTF-8",
+                "Accept": "application/json",
+                "apikey": anon,
+                "Authorization": f"Bearer {anon}",
+                "x-soartv-household-key": hh,
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                if 200 <= resp.status < 300:
+                    with self._lock:
+                        self._last_reported_ip = lan_ip.strip()
+                    return True
+        except Exception as exc:
+            AgentLogger.debug("Supabase gaming_hosts upsert skipped: %s", type(exc).__name__)
+        return False
+
+    def check_and_report_if_ip_changed(self, agent_port: int = DEFAULT_AGENT_PORT) -> None:
+        """Upserts `gaming_hosts` on startup and whenever the PC's LAN IPv4 address changes."""
+        if not self.is_configured():
+            return
+        now_ip = LocalNetworkInspector.get_primary_lan_ipv4()
+        if not now_ip:
+            return
+        with self._lock:
+            already = self._last_reported_ip == now_ip
+        if already:
+            return
+        if not self.report_host(now_ip, agent_port=agent_port):
+            with self._lock:
+                self._last_reported_ip = now_ip
 
 
 class LaptopGamingAgentApp:
@@ -8023,6 +8299,7 @@ class LaptopGamingAgentApp:
         self.tv_beacon = tv_beacon or TvBeaconNotifier(
             endpoint_store_path=(base_dir / "last_tv.json") if state_dir is not None else None
         )
+        self.supabase_reporter = SupabaseHostReporter()
         self.unlock_rate_limiter = SlidingWindowRateLimiter()
         self.pair_rate_limiter = SlidingWindowRateLimiter()
         self.sunshine_lifecycle = SunshineLifecycleController()
@@ -8389,7 +8666,9 @@ def create_http_server(
                     client_ip = self._client_ip()
                     if not TvBeaconNotifier.is_loopback_or_invalid_ip(client_ip):
                         app.tv_beacon.record_authenticated_tv(
-                            client_ip, self.headers.get("X-SoarTV-Tv-Port")
+                            client_ip,
+                            self.headers.get("X-SoarTV-Tv-Port"),
+                            self.headers.get("X-SoarTV-Tv-Id"),
                         )
                 self._send_json(
                     200,
@@ -8465,7 +8744,9 @@ def create_http_server(
 
                 if not TvBeaconNotifier.is_loopback_or_invalid_ip(client_ip):
                     app.tv_beacon.record_authenticated_tv(
-                        client_ip, self.headers.get("X-SoarTV-Tv-Port")
+                        client_ip,
+                        self.headers.get("X-SoarTV-Tv-Port"),
+                        self.headers.get("X-SoarTV-Tv-Id"),
                     )
                 self._send_json(200, {"ok": True, "paired": True, "token": issued_token})
                 return
@@ -8480,7 +8761,9 @@ def create_http_server(
 
             if not TvBeaconNotifier.is_loopback_or_invalid_ip(client_ip):
                 app.tv_beacon.record_authenticated_tv(
-                    client_ip, self.headers.get("X-SoarTV-Tv-Port")
+                    client_ip,
+                    self.headers.get("X-SoarTV-Tv-Port"),
+                    self.headers.get("X-SoarTV-Tv-Id"),
                 )
 
             if clean_path == "/api/gaming/sunshine/start":
@@ -8734,6 +9017,7 @@ def run_server(port: int = DEFAULT_AGENT_PORT) -> None:
     udp_responder = UdpDiscoveryResponder(host="0.0.0.0", port=port, tcp_port=port)
     udp_responder.start()
     app.tv_beacon.check_and_notify_if_ip_changed(agent_port=port)
+    app.supabase_reporter.check_and_report_if_ip_changed(agent_port=port)
 
     def hdmi_safety_watcher() -> None:
         was_hdmi = app.update_runtime_probe()
@@ -8746,6 +9030,7 @@ def run_server(port: int = DEFAULT_AGENT_PORT) -> None:
                     DisplayModeController.apply_display_mode(hdmi_connected=False)
                 was_hdmi = now_hdmi
                 app.tv_beacon.check_and_notify_if_ip_changed(agent_port=port)
+                app.supabase_reporter.check_and_report_if_ip_changed(agent_port=port)
                 ticks += 1
                 if ticks % CATALOG_REFRESH_EVERY_TICKS == 0:
                     app.refresh_and_sync(include_hidden=True, sync_sunshine=False)

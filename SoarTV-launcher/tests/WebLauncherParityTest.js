@@ -21,6 +21,7 @@ var fs = require('fs');
 var path = require('path');
 var vm = require('vm');
 var dgram = require('dgram');
+var nodeCrypto = require('crypto');
 
 var ROOT = path.join(__dirname, '..');
 var failures = 0;
@@ -380,6 +381,113 @@ expect(homeSb.Data.tmdbGenreQueryFor('tv', 'Anime').indexOf('with_original_langu
   var bad = box._storedKeys.filter(function (k) { return k.indexOf(':soartv.') < 0; });
   expect(bad.length, 0, 'Sandbox #' + idx + ' only accesses soartv.* localStorage keys');
 });
+
+// 11b. SoarTV v2 ES5 PBKDF2-HMAC-SHA256 + AES-256-GCM cross-platform compatibility with Java/OpenSSL
+var testHhKey = 'household-key-cross-platform-test-2026-xyz12345';
+var derivedPass = sb.SoarTvCrypto.deriveHouseholdVaultPassphrase(testHhKey);
+var expectedPass = nodeCrypto.createHash('sha256').update('soartv-vault-key-v2:' + testHhKey).digest('hex');
+expect(derivedPass, expectedPass, 'ES5 deriveHouseholdVaultPassphrase matches SHA-256 domain-separated spec');
+
+// Cross-verify PBKDF2-HMAC-SHA256 against Node/OpenSSL
+var pbSalt = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10];
+var es5Dk = sb.SoarTvCrypto.pbkdf2HmacSha256('test-passphrase', pbSalt, 1000, 32);
+var nodeDk = Array.prototype.slice.call(nodeCrypto.pbkdf2Sync('test-passphrase', Buffer.from(pbSalt), 1000, 32, 'sha256'));
+expect(Buffer.from(es5Dk).toString('hex'), Buffer.from(nodeDk).toString('hex'), 'ES5 PBKDF2-HMAC-SHA256 matches OpenSSL byte-for-byte');
+
+// Cross-verify AES-256-GCM envelope: Encrypt in Node/OpenSSL (exact Java CloudVaultCrypto format) -> Decrypt in ES5!
+var javaSalt = nodeCrypto.randomBytes(16);
+var javaIv = nodeCrypto.randomBytes(12);
+var javaKey = nodeCrypto.pbkdf2Sync(derivedPass, javaSalt, 120000, 32, 'sha256');
+var javaCipher = nodeCrypto.createCipheriv('aes-256-gcm', javaKey, javaIv);
+javaCipher.setAAD(Buffer.from('soartv-vault-v1:PBKDF2-HMAC-SHA256:120000', 'utf8'));
+var sampleSecrets = {tmdb_key: 'tmdb_v2_999', sensibo_api_key: 'sens_v2_888'};
+var javaCt = Buffer.concat([javaCipher.update(JSON.stringify(sampleSecrets), 'utf8'), javaCipher.final()]);
+var javaTag = javaCipher.getAuthTag();
+var javaEnvelope = {
+  vault_id: 'household',
+  kdf_algorithm: 'PBKDF2-HMAC-SHA256',
+  kdf_salt: javaSalt.toString('base64'),
+  kdf_iterations: 120000,
+  cipher_iv: javaIv.toString('base64'),
+  ciphertext: Buffer.concat([javaCt, javaTag]).toString('base64'),
+  key_count: 2
+};
+var decryptedInEs5 = sb.SoarTvCrypto.decryptVaultMap(javaEnvelope, derivedPass);
+expect(decryptedInEs5.tmdb_key, 'tmdb_v2_999', 'ES5 decryptVaultMap decrypts Java/OpenSSL AES-256-GCM vault');
+expect(decryptedInEs5.sensibo_api_key, 'sens_v2_888', 'ES5 decryptVaultMap preserves all secret entries');
+
+// Reverse direction: Encrypt in ES5 -> Decrypt in Node/OpenSSL!
+var es5Env = sb.SoarTvCrypto.encryptVaultMap('household', {omdb_key: 'omdb_from_lg_tv'}, derivedPass);
+expect(es5Env.vault_id, 'household', 'ES5 encryptVaultMap sets vault_id=household');
+var decKey = nodeCrypto.pbkdf2Sync(derivedPass, Buffer.from(es5Env.kdf_salt, 'base64'), es5Env.kdf_iterations, 32, 'sha256');
+var rawCtTag = Buffer.from(es5Env.ciphertext, 'base64');
+var decipher = nodeCrypto.createDecipheriv('aes-256-gcm', decKey, Buffer.from(es5Env.cipher_iv, 'base64'));
+decipher.setAAD(Buffer.from('soartv-vault-v1:PBKDF2-HMAC-SHA256:120000', 'utf8'));
+decipher.setAuthTag(rawCtTag.slice(rawCtTag.length - 16));
+var decJson = JSON.parse(Buffer.concat([decipher.update(rawCtTag.slice(0, rawCtTag.length - 16)), decipher.final()]).toString('utf8'));
+expect(decJson.omdb_key, 'omdb_from_lg_tv', 'OpenSSL/Java decrypts vault encrypted by LG/Samsung ES5 crypto');
+
+// Tampered tag rejection
+var tamperedEnv = JSON.parse(JSON.stringify(es5Env));
+tamperedEnv.ciphertext = 'A' + tamperedEnv.ciphertext.slice(1);
+var tamperCaught = false;
+try { sb.SoarTvCrypto.decryptVaultMap(tamperedEnv, derivedPass); } catch (e) { tamperCaught = true; }
+assert(tamperCaught, 'ES5 AES-256-GCM rejects tampered ciphertext/tag');
+
+// 11c. CanonicalWebApps cross-platform mapping & non-destructive merge
+expect(sb.CanonicalWebApps.toCanonical('youtube.leanback.v4', 'lg-webos'), 'youtube', 'webOS YouTube maps to canonical slug');
+expect(sb.CanonicalWebApps.toCanonical('com.apple.appletv', 'lg-webos'), 'appletv', 'webOS Apple TV maps to canonical slug');
+expect(sb.CanonicalWebApps.toCanonical('3201807016597', 'samsung-tizen'), 'appletv', 'Tizen Apple TV maps to same canonical slug');
+var resolvedOnLg = sb.CanonicalWebApps.resolveCanonicalListToLocal(
+  ['appletv', 'netflix', 'pkg:android:com.android.only'],
+  ['netflix', 'com.apple.appletv', 'youtube.leanback.v4'],
+  'lg-webos'
+);
+expect(resolvedOnLg.join(','), 'com.apple.appletv,netflix', 'Canonical cloud shelf resolves to LG webOS app IDs and skips Android-only apps');
+var mergedFromLg = sb.CanonicalWebApps.mergeCanonicalListNonDestructive(
+  ['appletv', 'netflix', 'pkg:android:com.android.only'],
+  ['netflix', 'com.apple.appletv'],
+  ['netflix', 'com.apple.appletv'],
+  'lg-webos'
+);
+expect(mergedFromLg.join(','), 'netflix,appletv,pkg:android:com.android.only', 'Non-destructive webOS merge preserves Android TV apps in cloud');
+
+// 11d. CloudSyncService field-level LWW merge & Gaming PC cloud IP resolution
+var lww = sb.CloudSyncService.mergeFieldMaps(
+  {theme: 'dark', tv_genres: ['Sci-Fi', 'Drama']},
+  {theme: 1000, tv_genres: 3000},
+  {theme: 'light', tv_genres: ['Drama', 'Sci-Fi'], language: 'en'},
+  {theme: 2000, tv_genres: 1000, language: 1500}
+);
+expect(lww.mergedValues.theme, 'light', 'Web LWW merge adopts newer remote theme');
+expect(lww.mergedValues.tv_genres.join(','), 'Sci-Fi,Drama', 'Web LWW merge preserves newer local genre order');
+expect(lww.mergedValues.language, 'en', 'Web LWW merge adopts remote-only field');
+assert(lww.localChanged && lww.remoteNeedsPush, 'Web LWW merge flags bidirectional sync');
+
+var cloudPcSb = createSandbox({
+  config: {supabaseUrl: 'https://demo-proj.supabase.co', supabaseAnonKey: 'anon-123', householdKey: testHhKey},
+  xhrResponder: function (req) {
+    if (req.url.indexOf('/rest/v1/gaming_hosts') >= 0) {
+      return {status: 200, body: [{host_id: 'pc-1', hostname: 'GAMING-RIG', lan_ip: '192.168.77.55', agent_port: 8485, mac_addresses: ['AA:BB:CC:DD:EE:FF']}]};
+    }
+    if (req.url.indexOf('/rest/v1/encrypted_vault') >= 0 && req.method === 'GET') {
+      return {status: 200, body: [javaEnvelope]};
+    }
+    if (req.url.indexOf('/rest/v1/user_profile_settings') >= 0 && req.method === 'GET') {
+      return {status: 200, body: [{profile_id: 'p1', settings: {theme: 'light'}, field_timestamps: {theme: 9999999999999}}]};
+    }
+    return {status: 200, body: []};
+  }
+});
+cloudPcSb.CloudSyncService.syncNow('test', function (err, changed) {
+  expect(err, null, 'Web CloudSyncService.syncNow completes cleanly');
+  expect(changed, true, 'Web CloudSyncService applies decrypted vault & remote settings');
+  expect(cloudPcSb.Prefs.tmdbKey(), 'tmdb_v2_999', 'Web TV hydrates TMDB key automatically from Household E2EE vault');
+  expect(cloudPcSb.Prefs.theme(), 'light', 'Web TV adopts remote profile theme');
+  expect(cloudPcSb.GamingService.resolvedPcIp(), '192.168.77.55', 'Web GamingService resolves live Gaming PC IP from cloud gaming_hosts');
+});
+var badCloudKeys = cloudPcSb._storedKeys.filter(function (k) { return k.indexOf(':soartv.') < 0; });
+expect(badCloudKeys.length, 0, 'CloudSyncService only accesses soartv.* localStorage keys');
 
 // 12. Async tests: Trakt device-code poll + LG webOS WiZ UDP 38899 service loopback
 var webosSvc = require(path.join(ROOT, 'webos', 'service', 'service.js'));

@@ -23,6 +23,8 @@ public class HomeActivity extends Activity {
     static final String EXTRA_INPUTS = "io.soartv.INPUTS";
     /** Opens the dedicated Gaming screen directly (e.g. when exiting an active PC game stream). */
     public static final String EXTRA_OPEN_GAMING = "io.soartv.OPEN_GAMING";
+    /** Returns focus cleanly to the Reels Top-Bar tab when exiting {@link ReelsPlayerActivity}. */
+    public static final String EXTRA_OPEN_REELS = "io.soartv.OPEN_REELS";
     /** Opens SoarTV's dedicated Settings tab directly (e.g. from the TV remote's Settings button). */
     public static final String EXTRA_OPEN_SETTINGS = "io.soartv.OPEN_SETTINGS";
     /** Retains exact navigation state across Activity recreations (e.g. language change or system restart). */
@@ -142,6 +144,9 @@ public class HomeActivity extends Activity {
                 || getIntent().getBooleanExtra(EXTRA_INPUTS, false)) {
             retainedNavSnapshot = null;
             home.showGamingScreen();
+        } else if (getIntent().getBooleanExtra(EXTRA_OPEN_REELS, false)) {
+            retainedNavSnapshot = null;
+            home.showReelsScreen();
         } else if (getIntent().getBooleanExtra(EXTRA_OPEN_SETTINGS, false)) {
             retainedNavSnapshot = null;
             home.showSettingsScreen();
@@ -256,6 +261,10 @@ public class HomeActivity extends Activity {
         if (intent.getBooleanExtra(EXTRA_OPEN_GAMING, false)
                 || intent.getBooleanExtra(EXTRA_INPUTS, false)) {
             home.showGamingScreen();
+            return;
+        }
+        if (intent.getBooleanExtra(EXTRA_OPEN_REELS, false)) {
+            home.showReelsScreen();
             return;
         }
         if (intent.getBooleanExtra(EXTRA_OPEN_SETTINGS, false)) {

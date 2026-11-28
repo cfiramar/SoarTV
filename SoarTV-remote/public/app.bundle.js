@@ -1319,6 +1319,12 @@
             return (await response.json());
         }
         /**
+         * Sends a Reels Player / Watch Later / Accounts command to the TV (`POST /api/reels`).
+         */
+        async reelsAction(action, extra = {}) {
+            return this.postOk('/api/reels', { action, ...extra });
+        }
+        /**
          * Broadcasts/casts a media or Reel/TikTok URL (`http://`, `https://`, `stremio://`) to the TV.
          */
         async castMedia(url, title = 'Shared Media', sender = 'Remote', saveReel = true) {
@@ -3863,6 +3869,22 @@
     /* ==========================================================================
        CAST, APPS, PROFILES, PAIRED DEVICES ADMIN & SYSTEM
        ========================================================================== */
+    async function triggerReelsAction(action) {
+        const ok = await remoteService.reelsAction(action);
+        if (ok) {
+            const labels = {
+                open_feed: 'Opening Reels Feed on TV...',
+                open_watch_later: 'Opening Watch Later Folder on TV...',
+                open_setup: 'Opening Reels Accounts Setup on TV...',
+                done_watching: 'Done Watching sent to TV...',
+                watch_later: 'Toggled Watch Later on TV',
+                next: 'Next video',
+                prev: 'Previous video',
+                play_pause: 'Play / Pause',
+            };
+            showToast(labels[action] || 'Sent to TV');
+        }
+    }
     async function castToTv(saveReel) {
         const urlInput = document.getElementById('castUrlInput');
         const titleInput = document.getElementById('castTitleInput');
@@ -4499,6 +4521,7 @@
             setAcParams,
             setLightParams,
             setBoilerTimer,
+            triggerReelsAction,
             castToTv,
             quickCastUrl,
             launchApp,

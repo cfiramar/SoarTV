@@ -2535,6 +2535,18 @@
            TAB 4: REELS & CAST (Hidden automatically when enabledTabs.reels=false)
            ==================================================================== -->
       <main id="tab-cast" class="tab-pane">
+        <div class="section-title"><span>TV Reels Feed</span></div>
+        <div class="tv-row is-active" style="margin-bottom:12px;">
+          <div class="input-row" style="margin-bottom:8px;">
+            <button class="btn pill-focus" style="flex:1;" onclick="triggerReelsAction('open_feed')">Watch Feed</button>
+            <button class="btn" style="flex:1;" onclick="triggerReelsAction('open_watch_later')">Watch Later</button>
+          </div>
+          <div class="input-row">
+            <button class="btn" style="flex:1;" onclick="triggerReelsAction('done_watching')">Done Watching</button>
+            <button class="btn" style="flex:1;" onclick="triggerReelsAction('watch_later')">Save Current</button>
+            <button class="btn" onclick="triggerReelsAction('open_setup')">Accounts</button>
+          </div>
+        </div>
         <div class="section-title"><span>Send Link to TV</span></div>
         <div class="tv-row is-active" style="margin-bottom:12px;">
           <div class="input-row">

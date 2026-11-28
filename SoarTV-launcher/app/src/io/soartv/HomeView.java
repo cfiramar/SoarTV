@@ -1796,6 +1796,12 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             selectScreen(SCREEN_GAMING);
             zone = Z_CARDS;
             retarget(false);
+        } else if (reelsOnResume) {
+            reelsOnResume = false;
+            selectScreen(SCREEN_REELS);
+            zone = Z_TOP;
+            topIndex = SCREEN_REELS;
+            retarget(false);
         } else if (settingsOnResume) {
             settingsOnResume = false;
             showSettingsScreen();
@@ -5577,6 +5583,40 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
 
     private boolean allAppsOnResume;
 
+    /** Returns focus cleanly to the Reels Top-Bar tab after exiting {@link ReelsPlayerActivity}. */
+    void showReelsScreen() {
+        if (!running) {
+            reelsOnResume = true;
+            return;
+        }
+        selectScreen(SCREEN_REELS);
+        zone = Z_TOP;
+        topIndex = SCREEN_REELS;
+        retarget(false);
+    }
+
+    private boolean reelsOnResume;
+
+    /** Launches the isolated full-screen adaptive vertical/horizontal Reels player immediately. */
+    private void launchReelsPlayer(boolean openWatchLater) {
+        try {
+            Intent intent = new Intent(activity, ReelsPlayerActivity.class)
+                    .putExtra(ReelsPlayerActivity.EXTRA_OPEN_WATCH_LATER, openWatchLater);
+            activity.startActivity(intent);
+        } catch (RuntimeException e) {
+            showToast(Ui.tr("Couldn't open Reels player."));
+        }
+    }
+
+    /** Launches the dedicated TV Reels account &amp; family group chat setup activity. */
+    private void launchReelsConnectSetup() {
+        try {
+            activity.startActivity(new Intent(activity, ReelsConnectActivity.class));
+        } catch (RuntimeException e) {
+            showToast(Ui.tr("Couldn't open Reels account setup."));
+        }
+    }
+
     /** Opens the Gaming screen directly when returning from an active native game stream. */
     void showGamingScreen() {
         if (!running) {
@@ -7995,6 +8035,10 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         if (zone == Z_TOP) {
             click.open();
             flushPendingTopBarScreenSwitch();
+            if (topIndex == SCREEN_REELS) {
+                launchReelsPlayer(false);
+                return;
+            }
             if (activeScreen != topIndex) {
                 selectScreen(topIndex);
             }
@@ -8214,6 +8258,12 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 heroLayer.invalidate();
                 wake();
             }));
+        } else if ("reel_open_feed".equals(act.id)) {
+            launchReelsPlayer(false);
+        } else if ("reel_open_watch_later".equals(act.id)) {
+            launchReelsPlayer(true);
+        } else if ("reel_open_setup".equals(act.id)) {
+            launchReelsConnectSetup();
         } else if (act.id.startsWith("reel_url:")) {
             String url = act.id.substring("reel_url:".length());
             onRemoteCastUrl(url, act.title, act.subtitle);
@@ -9862,21 +9912,32 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 break;
             }
             case SCREEN_REELS: {
+                ReelsRepository reelsRepo = ReelsRepository.get(c);
+                List<String> connectedSources = reelsRepo.getConnectedSourceIds();
+                int wlCount = reelsRepo.loadWatchLater().size();
+                int cachedCount = reelsRepo.loadCachedFeedItems().size();
                 List<ActionCard> reelCards = new ArrayList<>();
-                for (SupabaseClient.SharedReel r : sharedReelsList) {
-                    if (r.videoUrl == null || r.videoUrl.isEmpty()) continue;
-                    String title = (r.title != null && !r.title.isEmpty()) ? r.title : Ui.tr("Shared Reel");
-                    String sub = (r.senderName != null && !r.senderName.isEmpty())
-                            ? (Ui.tr("Shared by ") + r.senderName) : "TikTok / Reels";
-                    reelCards.add(new ActionCard("reel_url:" + r.videoUrl, title, sub, "tiktok",
-                            0xFFEC4899, 0xFF831843, null));
+                String feedSub;
+                if (connectedSources.isEmpty()) {
+                    feedSub = Ui.tr("Press OK or Down to connect Instagram & TikTok");
+                } else if (cachedCount > 0) {
+                    feedSub = cachedCount + " " + Ui.tr("unwatched · Oldest first");
+                } else {
+                    feedSub = Ui.tr("Instant full-screen vertical & 16:9 feed");
                 }
-                reelCards.add(new ActionCard("reel_url:https://www.youtube.com/shorts",
-                        Ui.tr("YouTube Shorts Feed"), Ui.tr("Watch trending vertical shorts"), "tiktok",
-                        0xFFE11D48, 0xFF881337, null));
-                reelCards.add(new ActionCard("reel_url:https://www.tiktok.com",
-                        Ui.tr("TikTok TV Feed"), Ui.tr("Open TikTok trending videos"), "tiktok",
-                        0xFF111827, 0xFF000000, null));
+                reelCards.add(new ActionCard("reel_open_feed",
+                        Ui.tr("Watch Reels Feed"), feedSub, "tiktok",
+                        0xFF2563EB, 0xFF1D4ED8, null));
+                reelCards.add(new ActionCard("reel_open_watch_later",
+                        Ui.tr("Watch Later Folder"),
+                        wlCount > 0 ? (wlCount + " " + Ui.tr("saved videos")) : Ui.tr("No saved videos yet"),
+                        "folder", 0xFF4F46E5, 0xFF3730A3, null));
+                reelCards.add(new ActionCard("reel_open_setup",
+                        Ui.tr("TV Accounts & Family Names"),
+                        connectedSources.isEmpty()
+                                ? Ui.tr("Connect Instagram & TikTok group chats")
+                                : (connectedSources.size() + " " + Ui.tr("connected · Rename senders")),
+                        "users", 0xFF2C2D31, 0xFF1F2430, null));
                 browserRows.add(new BrowserRow(ROW_ACTIONS, Ui.tr("Reels & TikTok"), null,
                         null, null, null, reelCards, null));
                 break;
@@ -12818,6 +12879,8 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             openTraktAuthDialog();
         } else if ("stremio_auth".equals(id)) {
             openStremioAuthDialog();
+        } else if ("reels_connect_accounts".equals(id) || "setup_reels_accounts".equals(id)) {
+            launchReelsConnectSetup();
         } else if ("users_sync_all".equals(id)) {
             Prefs.setLastAccountSyncAt(System.currentTimeMillis());
             rebuildSettingsTree();
@@ -14299,6 +14362,11 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
             }
             if (dy > 0) {
                 flushPendingTopBarScreenSwitch();
+                if (topIndex == SCREEN_REELS) {
+                    click.open();
+                    launchReelsPlayer(false);
+                    return true;
+                }
                 zone = Z_CARDS;
                 homeRow = 0;
                 if (!browserRows.isEmpty()) {

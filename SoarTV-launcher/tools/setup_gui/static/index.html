@@ -1204,11 +1204,48 @@
               </div>
 
               <div class="tv-row">
+                <div class="tv-row-head">
+                  <div class="tv-row-main">
+                    <svg class="icon tv-row-icon" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+                    <div>
+                      <div class="tv-row-title">Reels &amp; TikTok Tab</div>
+                      <div class="tv-row-sub">Instant full-screen vertical (9:16) &amp; horizontal (16:9) TV feed for TikTok &amp; Instagram Reels shared in your couple or 3+ family group chats (works across iPhone &amp; Android).</div>
+                    </div>
+                  </div>
+                  <label class="tv-switch">
+                    <input id="toggleReels" type="checkbox" onchange="onToggleOptionalTabs()" />
+                    <span class="tv-slider"></span>
+                  </label>
+                </div>
+              </div>
+
+              <div id="reelsAccountGuideRow" class="tv-row" style="display:none;">
+                <div class="tv-row-head">
+                  <div class="tv-row-main">
+                    <svg class="icon tv-row-icon" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                    <div>
+                      <div class="tv-row-title">Create Dedicated TV Accounts for Reels (Only Needed When Reels Is Enabled)</div>
+                      <div class="tv-row-sub">Keep your personal accounts private! Create a free dedicated TV account (e.g. <code>@livingroom.tv</code>) on Instagram and/or TikTok, add it to your couple or 3+ family group chat, and sign in once on the TV (TikTok supports instant QR login).</div>
+                    </div>
+                  </div>
+                  <div style="display:flex; gap:6px;">
+                    <a class="tv-link-action" href="https://www.instagram.com/accounts/emailsignup/" target="_blank" rel="noopener">Instagram Sign Up</a>
+                    <a class="tv-link-action" href="https://www.tiktok.com/signup" target="_blank" rel="noopener">TikTok Sign Up</a>
+                  </div>
+                </div>
+                <div class="tv-row-controls stack" style="font-size:12.5px; color:rgba(255,255,255,0.78); line-height:1.55;">
+                  <div><strong>1.</strong> Create a free dedicated TV account on Instagram and/or TikTok (keeps your personal DMs untouched).</div>
+                  <div><strong>2.</strong> Create a native group chat in Instagram and/or TikTok with your partner or family (3+ members supported on iPhone &amp; Android) and add the TV account.</div>
+                  <div><strong>3.</strong> After installing SoarTV, open <strong>Reels &rarr; Accounts &amp; Names</strong> (or <strong>Settings &rarr; Initial Setup &rarr; Step 7: Reels TV Accounts</strong>) to sign in once, pick your group chats, and give each family member a custom display name.</div>
+                </div>
+              </div>
+
+              <div class="tv-row">
                 <div class="tv-row-main">
                   <svg class="icon tv-row-icon" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="13" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/></svg>
                   <div>
                     <div class="tv-row-title">Your TV Top-Bar Preview</div>
-                    <div class="tv-row-sub">Shared Reels is Work in Progress and disabled in public builds.</div>
+                    <div class="tv-row-sub">Toggle any optional tab above to preview your clean TV Top-Bar.</div>
                   </div>
                 </div>
                 <div class="preview-bar">
@@ -1216,6 +1253,7 @@
                   <span class="preview-tab active-home">Home</span>
                   <span class="preview-tab">Apps</span>
                   <span id="prevTabGaming" class="preview-tab hidden-tab">Gaming</span>
+                  <span id="prevTabReels" class="preview-tab hidden-tab">Reels</span>
                   <span id="prevTabSmartHome" class="preview-tab hidden-tab">Smart-Home</span>
                   <span class="preview-tab">Settings</span>
                 </div>
@@ -1923,11 +1961,14 @@
     function onToggleOptionalTabs() {
       const sh = document.getElementById('toggleSmartHome').checked;
       const gm = document.getElementById('toggleGaming').checked;
+      const rl = document.getElementById('toggleReels').checked;
       document.getElementById('gamingFoldersRow').style.display = gm ? 'block' : 'none';
+      document.getElementById('reelsAccountGuideRow').style.display = rl ? 'block' : 'none';
       document.getElementById('prevTabSmartHome').classList.toggle('hidden-tab', !sh);
       document.getElementById('prevTabGaming').classList.toggle('hidden-tab', !gm);
+      document.getElementById('prevTabReels').classList.toggle('hidden-tab', !rl);
 
-      const activeCount = (sh ? 1 : 0) + (gm ? 1 : 0);
+      const activeCount = (sh ? 1 : 0) + (gm ? 1 : 0) + (rl ? 1 : 0);
       document.getElementById('val-tabs').innerHTML = activeCount > 0
         ? `<span class="dot dot-green"></span>${activeCount} Active`
         : 'Core Only';
@@ -1967,6 +2008,7 @@
         temperature: document.getElementById('tempUnit').value,
         enable_smarthome: document.getElementById('toggleSmartHome').checked ? 'true' : 'false',
         enable_gaming: document.getElementById('toggleGaming').checked ? 'true' : 'false',
+        enable_reels: document.getElementById('toggleReels').checked ? 'true' : 'false',
         games_dirs: gameFolders.join(';'),
         custom_smarthome: customSmartHome.map(item => ({ brand: item.brand, api_key: item.api_key || '' }))
       };
@@ -2004,7 +2046,7 @@
         const summaryLines = [
           `<div><strong>TV Platform:</strong> ${escapeHtml(tvPlatform.replace('_', ' '))}${v.tv_ip ? ' &middot; ' + escapeHtml(v.tv_ip) : ''}</div>`,
           `<div><strong>Location:</strong> ${v.city ? escapeHtml(v.city) : 'Not set yet (agent can ask)'}</div>`,
-          `<div><strong>Optional Tabs:</strong> Smart-Home ${v.enable_smarthome === 'true' ? 'Enabled' : 'Hidden'} &middot; PC Gaming ${v.enable_gaming === 'true' ? 'Enabled' : 'Hidden'}</div>`,
+          `<div><strong>Optional Tabs:</strong> Smart-Home ${v.enable_smarthome === 'true' ? 'Enabled' : 'Hidden'} &middot; PC Gaming ${v.enable_gaming === 'true' ? 'Enabled' : 'Hidden'} &middot; Reels ${v.enable_reels === 'true' ? 'Enabled' : 'Hidden'}</div>`,
           `<div><strong>Saved Private API Keys:</strong> ${savedKeyCount} configured${customList.length ? ' + ' + customList.length + ' custom Smart-Home brand(s)' : ''}</div>`
         ];
         document.getElementById('doneSummary').innerHTML = summaryLines.join('');
@@ -2096,6 +2138,7 @@
 
       document.getElementById('toggleSmartHome').checked = (v.enable_smarthome === 'true');
       document.getElementById('toggleGaming').checked = (v.enable_gaming === 'true');
+      document.getElementById('toggleReels').checked = (v.enable_reels === 'true');
       onToggleOptionalTabs();
       onPlatformChange();
       onCityTyped();

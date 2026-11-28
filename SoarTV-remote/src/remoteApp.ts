@@ -2424,6 +2424,25 @@ async function setBoilerTimer(deviceId: string, timerMinutes: number, ev?: Event
 /* ==========================================================================
    CAST, APPS, PROFILES, PAIRED DEVICES ADMIN & SYSTEM
    ========================================================================== */
+async function triggerReelsAction(
+  action: 'open_feed' | 'open_watch_later' | 'open_setup' | 'done_watching' | 'watch_later' | 'next' | 'prev' | 'play_pause'
+): Promise<void> {
+  const ok = await remoteService.reelsAction(action);
+  if (ok) {
+    const labels: Record<string, string> = {
+      open_feed: 'Opening Reels Feed on TV...',
+      open_watch_later: 'Opening Watch Later Folder on TV...',
+      open_setup: 'Opening Reels Accounts Setup on TV...',
+      done_watching: 'Done Watching sent to TV...',
+      watch_later: 'Toggled Watch Later on TV',
+      next: 'Next video',
+      prev: 'Previous video',
+      play_pause: 'Play / Pause',
+    };
+    showToast(labels[action] || 'Sent to TV');
+  }
+}
+
 async function castToTv(saveReel: boolean): Promise<void> {
   const urlInput = document.getElementById('castUrlInput') as HTMLInputElement | null;
   const titleInput = document.getElementById('castTitleInput') as HTMLInputElement | null;
@@ -3085,6 +3104,7 @@ function registerNativeCallbacksAndGlobals(): void {
     setAcParams,
     setLightParams,
     setBoilerTimer,
+    triggerReelsAction,
     castToTv,
     quickCastUrl,
     launchApp,

@@ -1081,6 +1081,210 @@ public final class SupabaseClient {
         });
     }
 
+    /** Callback receiving cloud-synced Reels watermarks, sender aliases, and Watch Later items. */
+    public interface ReelsCloudStateCallback {
+        void onLoaded(
+                Map<String, ReelsModels.SourceWatermark> watermarks,
+                Map<String, ReelsModels.SenderAlias> senders,
+                List<ReelsModels.FeedItem> watchLater);
+    }
+
+    /** Upserts a source's sync thread &amp; read watermark into {@code public.reel_sync_state}. */
+    public void upsertReelSyncStateAsync(ReelsModels.SourceWatermark wm) {
+        if (wm == null || wm.sourceId.isEmpty() || !isConfigured()) return;
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("source", wm.sourceId);
+        row.put("thread_id", wm.threadId);
+        row.put("thread_title", wm.threadTitle);
+        row.put("self_sender_id", wm.selfSenderId);
+        row.put("last_watched_message_id", wm.lastWatchedMessageId);
+        if (wm.lastWatchedSentAtMs > 0L) {
+            row.put("last_watched_sent_at", formatIsoUtc(wm.lastWatchedSentAtMs));
+        }
+        row.put("latest_chat_message_id", wm.latestChatMessageId);
+        final String body = CloudVaultCrypto.JsonCodec.toJsonObjectString(row);
+        IO.execute(() -> {
+            try {
+                request("POST", "/rest/v1/reel_sync_state?on_conflict=source", body,
+                        "resolution=merge-duplicates,return=minimal");
+            } catch (IOException e) {
+                safeLogW("Supabase upsertReelSyncState skipped: " + e.getMessage());
+            }
+        });
+    }
+
+    /** Upserts a custom family/group sender display name into {@code public.reel_senders}. */
+    public void upsertReelSenderAsync(ReelsModels.SenderAlias alias) {
+        if (alias == null || alias.senderId.isEmpty() || !isConfigured()) return;
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("source", alias.sourceId);
+        row.put("sender_external_id", alias.senderId);
+        row.put("raw_username", alias.rawUsername);
+        row.put("display_name", alias.displayName);
+        row.put("avatar_color", alias.avatarColor);
+        final String body = CloudVaultCrypto.JsonCodec.toJsonObjectString(row);
+        IO.execute(() -> {
+            try {
+                request("POST", "/rest/v1/reel_senders?on_conflict=source,sender_external_id", body,
+                        "resolution=merge-duplicates,return=minimal");
+            } catch (IOException e) {
+                safeLogW("Supabase upsertReelSender skipped: " + e.getMessage());
+            }
+        });
+    }
+
+    /** Saves a video/link into {@code public.shared_reels} flagged as {@code watch_later = true}. */
+    public void saveWatchLaterReelAsync(ReelsModels.FeedItem item, String senderDisplayName) {
+        if (item == null || item.shareUrl.isEmpty() || !isConfigured()) return;
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("sender_name", (senderDisplayName == null || senderDisplayName.isEmpty()) ? "Member" : senderDisplayName);
+        row.put("sender_external_id", item.senderId);
+        row.put("platform", item.sourceId);
+        row.put("source_thread_id", item.threadId);
+        row.put("source_message_id", item.messageId);
+        row.put("item_kind", item.kind.wireValue);
+        row.put("url", item.shareUrl);
+        row.put("title", item.caption.isEmpty() ? (item.sourceId + " video") : item.caption);
+        row.put("message_text", item.messageText);
+        row.put("thumbnail_url", item.thumbnailUrl);
+        row.put("watched", false);
+        row.put("watch_later", true);
+        row.put("watch_later_added_at", formatIsoUtc(
+                item.watchLaterAddedAtMs > 0L ? item.watchLaterAddedAtMs : System.currentTimeMillis()));
+        row.put("sent_at", formatIsoUtc(item.sentAtMs > 0L ? item.sentAtMs : System.currentTimeMillis()));
+        final String body = CloudVaultCrypto.JsonCodec.toJsonObjectString(row);
+        IO.execute(() -> {
+            try {
+                request("POST", "/rest/v1/shared_reels", body, "return=minimal");
+            } catch (IOException e) {
+                safeLogW("Supabase saveWatchLaterReel skipped: " + e.getMessage());
+            }
+        });
+    }
+
+    /** Updates {@code watch_later} flag on matching {@code public.shared_reels} rows by URL. */
+    public void setSharedReelWatchLaterAsync(String shareUrl, boolean watchLater) {
+        if (shareUrl == null || shareUrl.trim().isEmpty() || !isConfigured()) return;
+        Map<String, Object> patch = new LinkedHashMap<>();
+        patch.put("watch_later", watchLater);
+        if (!watchLater) patch.put("watched", true);
+        final String body = CloudVaultCrypto.JsonCodec.toJsonObjectString(patch);
+        final String encoded;
+        try {
+            encoded = URLEncoder.encode(shareUrl.trim(), "UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            return;
+        }
+        IO.execute(() -> {
+            try {
+                request("PATCH", "/rest/v1/shared_reels?url=eq." + encoded, body, "return=minimal");
+            } catch (IOException e) {
+                safeLogW("Supabase setSharedReelWatchLater skipped: " + e.getMessage());
+            }
+        });
+    }
+
+    /** Fetches cloud watermarks, sender names, and Watch Later items asynchronously. */
+    public void fetchReelsCloudStateAsync(ReelsCloudStateCallback callback) {
+        if (callback == null) return;
+        if (!isConfigured()) {
+            callback.onLoaded(Collections.<String, ReelsModels.SourceWatermark>emptyMap(),
+                    Collections.<String, ReelsModels.SenderAlias>emptyMap(),
+                    Collections.<ReelsModels.FeedItem>emptyList());
+            return;
+        }
+        IO.execute(() -> {
+            Map<String, ReelsModels.SourceWatermark> wms = new LinkedHashMap<>();
+            Map<String, ReelsModels.SenderAlias> senders = new LinkedHashMap<>();
+            List<ReelsModels.FeedItem> watchLater = new ArrayList<>();
+            try {
+                String wmResp = request("GET",
+                        "/rest/v1/reel_sync_state?select=source,thread_id,thread_title,self_sender_id,last_watched_message_id,last_watched_sent_at,latest_chat_message_id",
+                        null, null);
+                for (Map<String, Object> o : CloudVaultCrypto.JsonCodec.parseJsonObjectArray(wmResp)) {
+                    String src = CloudVaultCrypto.JsonCodec.optString(o, "source", "");
+                    if (src.isEmpty()) continue;
+                    long sentMs = parseIsoUtcMs(CloudVaultCrypto.JsonCodec.optString(o, "last_watched_sent_at", ""));
+                    wms.put(ReelsModels.normalizeSourceId(src), new ReelsModels.SourceWatermark(
+                            src,
+                            CloudVaultCrypto.JsonCodec.optString(o, "thread_id", ""),
+                            CloudVaultCrypto.JsonCodec.optString(o, "thread_title", ""),
+                            CloudVaultCrypto.JsonCodec.optString(o, "self_sender_id", ""),
+                            CloudVaultCrypto.JsonCodec.optString(o, "last_watched_message_id", ""),
+                            sentMs,
+                            CloudVaultCrypto.JsonCodec.optString(o, "latest_chat_message_id", "")));
+                }
+            } catch (IOException | RuntimeException e) {
+                safeLogW("Supabase fetch reel_sync_state skipped: " + e.getMessage());
+            }
+            try {
+                String sResp = request("GET",
+                        "/rest/v1/reel_senders?select=source,sender_external_id,raw_username,display_name,avatar_color",
+                        null, null);
+                senders.putAll(ReelsRepository.parseSendersJson(sResp));
+            } catch (IOException | RuntimeException e) {
+                safeLogW("Supabase fetch reel_senders skipped: " + e.getMessage());
+            }
+            try {
+                String wlResp = request("GET",
+                        "/rest/v1/shared_reels?select=id,sender_name,sender_external_id,platform,source_thread_id,source_message_id,item_kind,url,title,message_text,thumbnail_url,watch_later,watch_later_added_at,sent_at&watch_later=eq.true&order=watch_later_added_at.asc&limit=100",
+                        null, null);
+                for (Map<String, Object> o : CloudVaultCrypto.JsonCodec.parseJsonObjectArray(wlResp)) {
+                    String url = CloudVaultCrypto.JsonCodec.optString(o, "url", "");
+                    if (url.isEmpty()) continue;
+                    String plat = CloudVaultCrypto.JsonCodec.optString(o, "platform",
+                            ReelsSourceRegistry.getDefault().detectSourceIdForUrl(url));
+                    String msgId = CloudVaultCrypto.JsonCodec.optString(o, "source_message_id",
+                            CloudVaultCrypto.JsonCodec.optString(o, "id", ""));
+                    watchLater.add(new ReelsModels.FeedItem(
+                            CloudVaultCrypto.JsonCodec.optString(o, "id", ""),
+                            plat,
+                            ReelsModels.ItemKind.fromWire(CloudVaultCrypto.JsonCodec.optString(o, "item_kind", "video")),
+                            CloudVaultCrypto.JsonCodec.optString(o, "source_thread_id", ""),
+                            msgId,
+                            CloudVaultCrypto.JsonCodec.optString(o, "sender_external_id", ""),
+                            CloudVaultCrypto.JsonCodec.optString(o, "sender_name", "Member"),
+                            parseIsoUtcMs(CloudVaultCrypto.JsonCodec.optString(o, "sent_at", "")),
+                            url, "", 0, 0, null, null, "",
+                            CloudVaultCrypto.JsonCodec.optString(o, "thumbnail_url", ""),
+                            CloudVaultCrypto.JsonCodec.optString(o, "title", ""),
+                            CloudVaultCrypto.JsonCodec.optString(o, "message_text", ""),
+                            true,
+                            parseIsoUtcMs(CloudVaultCrypto.JsonCodec.optString(o, "watch_later_added_at", ""))));
+                }
+            } catch (IOException | RuntimeException e) {
+                safeLogW("Supabase fetch watch_later skipped: " + e.getMessage());
+            }
+            callback.onLoaded(wms, senders, watchLater);
+        });
+    }
+
+    private static String formatIsoUtc(long epochMs) {
+        java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
+        fmt.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+        return fmt.format(new java.util.Date(epochMs));
+    }
+
+    private static long parseIsoUtcMs(String iso) {
+        if (iso == null || iso.trim().isEmpty()) return 0L;
+        String clean = iso.trim();
+        String[] patterns = new String[] {
+            "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+            "yyyy-MM-dd'T'HH:mm:ssXXX",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+            "yyyy-MM-dd'T'HH:mm:ss'Z'"
+        };
+        for (String p : patterns) {
+            try {
+                java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat(p, Locale.US);
+                fmt.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+                return fmt.parse(clean).getTime();
+            } catch (Exception ignored) {
+            }
+        }
+        return 0L;
+    }
+
     // MARK: - Zero-Knowledge Encrypted Cloud Key Backup Vault
 
     /**

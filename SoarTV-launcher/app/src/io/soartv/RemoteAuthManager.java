@@ -462,6 +462,7 @@ public final class RemoteAuthManager {
                 || "/api/voice".equals(path)
                 || "/api/ai".equals(path)
                 || "/api/cast".equals(path)
+                || "/api/reels".equals(path)
                 || "/api/app".equals(path);
     }
 

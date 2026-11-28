@@ -1934,6 +1934,16 @@ export class TvRemoteService {
   }
 
   /**
+   * Sends a Reels Player / Watch Later / Accounts command to the TV (`POST /api/reels`).
+   */
+  public async reelsAction(
+    action: 'open_feed' | 'open_watch_later' | 'open_setup' | 'done_watching' | 'watch_later' | 'next' | 'prev' | 'play_pause' | 'rename_sender',
+    extra: Record<string, unknown> = {}
+  ): Promise<boolean> {
+    return this.postOk('/api/reels', { action, ...extra });
+  }
+
+  /**
    * Broadcasts/casts a media or Reel/TikTok URL (`http://`, `https://`, `stremio://`) to the TV.
    */
   public async castMedia(

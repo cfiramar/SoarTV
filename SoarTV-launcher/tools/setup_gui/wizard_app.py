@@ -73,6 +73,7 @@ CONFIG_TO_DOTENV_MAP: Dict[str, str] = {
     "gaming_pc_mac": "GAMING_PC_MAC",
     "enable_gaming": "ENABLE_GAMING",
     "enable_smarthome": "ENABLE_SMARTHOME",
+    "enable_reels": "ENABLE_REELS",
     "custom_smarthome_brands": "CUSTOM_SMARTHOME_BRANDS",
     "city": "CITY",
     "latitude": "LATITUDE",
@@ -176,6 +177,7 @@ class SetupConfigStore:
             "temperature": get_val("temperature", "auto"),
             "enable_gaming": get_val("enable_gaming", "auto"),
             "enable_smarthome": get_val("enable_smarthome", "auto"),
+            "enable_reels": get_val("enable_reels", "false"),
             "trakt_username": get_val("trakt_username", ""),
             "stremio_email": cfg.get("stremio_email", ""),
             "supabase_url": get_val("supabase_url", ""),
@@ -294,6 +296,7 @@ class AgentPromptBuilder:
         custom_smarthome: Optional[List[Dict[str, Any]]] = None,
         onboarding_mode: str = "add_tv",
         replace_tv_id: str = "",
+        enable_reels: bool = False,
     ) -> str:
         """Builds a clear, human-readable instruction prompt for Claude Code, Antigravity, Cursor, or Codex."""
         plat = cls.PLATFORM_LABELS.get(tv_platform, "Smart TV")
@@ -349,10 +352,18 @@ class AgentPromptBuilder:
         else:
             gm_line = "- PC Gaming Tab: DISABLE — I will not stream PC games to this TV right now, so hide the Gaming tab (`enable_gaming=false`)."
 
+        if enable_reels:
+            reels_line = (
+                "\n- Reels & TikTok Tab: ENABLE (`enable_reels=true`) — guide me through creating dedicated free TV Instagram/TikTok accounts, "
+                "adding them to our couple or 3+ family group chats, signing in once on the TV, and naming each family member."
+            )
+        else:
+            reels_line = ""
+
         return (
             f"Read `AGENTS.md` and `docs/agents/install-playbook.md` and help me install and configure SoarTV on my {plat}{ip_part}.{city_part}\n"
             f"{sh_line}\n"
-            f"{gm_line}{cloud_line}\n"
+            f"{gm_line}{cloud_line}{reels_line}\n"
             "First save an immutable local backup of my TV's initial native state (`python3 SoarTV-launcher/tools/tv_state_backup.py <TV_IP> --backup`) before making any changes, "
             "check any keys I already saved in `SoarTV-launcher/config.properties` / `.env` (never print secret values in chat), "
             "guide me step-by-step for anything missing, verify my TV brand compatibility safely, build, and install SoarTV."
@@ -895,6 +906,7 @@ def create_setup_http_server(
                     custom_smarthome=body.get("custom_smarthome") if isinstance(body.get("custom_smarthome"), list) else None,
                     onboarding_mode=str(body.get("onboarding_mode", "add_tv")),
                     replace_tv_id=str(body.get("replace_tv_id", "")),
+                    enable_reels=bool(body.get("enable_reels", False)),
                 )
                 self._send_json(200, {"ok": True, "prompt": prompt})
                 return

@@ -346,6 +346,10 @@ public final class SettingsTree {
         public boolean developerOptionsEnabled = false;
         public boolean gamingTabEnabled = true;
         public boolean smartHomeTabEnabled = true;
+        public boolean reelsTabEnabled = false;
+        public int reelsConnectedCount = 0;
+        public String reelsConnectedSummary = "";
+        public int reelsWatchLaterCount = 0;
         public String gamingTabMode = FeatureTabs.MODE_AUTO;
         public String smartHomeTabMode = FeatureTabs.MODE_AUTO;
 
@@ -419,6 +423,21 @@ public final class SettingsTree {
             s.cloudSyncStatus = cloudSum.statusText;
             s.cloudLastSyncAt = cloudSum.lastSyncAtMs;
             s.householdTvDevices = SupabaseClient.get(c).getCachedActiveTvDevices();
+            s.reelsTabEnabled = FeatureTabs.isReelsEnabled();
+            if (s.reelsTabEnabled) {
+                ReelsRepository reelsRepo = ReelsRepository.get(c);
+                List<String> connectedSources = reelsRepo.getConnectedSourceIds();
+                s.reelsConnectedCount = connectedSources.size();
+                if (!connectedSources.isEmpty()) {
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 0; i < connectedSources.size(); i++) {
+                        if (i > 0) sb.append(" + ");
+                        sb.append(ReelsSourceRegistry.getDefault().displayNameFor(connectedSources.get(i)));
+                    }
+                    s.reelsConnectedSummary = sb.toString();
+                }
+                s.reelsWatchLaterCount = reelsRepo.loadWatchLater().size();
+            }
             s.gamingPcIp = safeString(GamingZone.getLaptopIp(c));
             GamingZone.LaptopStatus cachedPc = GamingZone.getCachedLaptopStatus(c);
             if (cachedPc != null) {
@@ -1714,6 +1733,29 @@ public final class SettingsTree {
                 "System",
                 "user");
 
+        List<Node> userChildren = new ArrayList<>();
+        userChildren.add(profileNode);
+        userChildren.add(cloudSyncNode);
+        userChildren.add(cloudTvsNode);
+        userChildren.add(traktNode);
+        userChildren.add(stremioNode);
+        userChildren.add(stremioSharedNode);
+        if (s.reelsTabEnabled) {
+            boolean reelsReady = s.reelsConnectedCount > 0;
+            userChildren.add(actionNode(
+                    "reels_connect_accounts",
+                    "Reels TV Accounts & Family Chats",
+                    reelsReady
+                            ? "Manage Instagram / TikTok TV group chats & custom sender display names"
+                            : "Create dedicated TV Instagram/TikTok accounts, add to group chat & sign in once",
+                    reelsReady ? s.reelsConnectedSummary : "Set Up",
+                    "tiktok",
+                    reelsReady,
+                    reelsReady ? StatusTone.POSITIVE : StatusTone.WARNING));
+        }
+        userChildren.add(syncAllNode);
+        userChildren.add(googleAccounts);
+
         return groupNode(
                 "users",
                 "Accounts & Profiles",
@@ -1723,7 +1765,7 @@ public final class SettingsTree {
                 false,
                 "",
                 StatusTone.NONE,
-                Arrays.asList(profileNode, cloudSyncNode, cloudTvsNode, traktNode, stremioNode, stremioSharedNode, syncAllNode, googleAccounts));
+                userChildren);
     }
 
     private static Node buildCloudSyncActionNode(StateSnapshot s, String id, String title) {
@@ -2320,6 +2362,29 @@ public final class SettingsTree {
                 allDone,
                 allDone ? StatusTone.POSITIVE : StatusTone.NONE);
 
+        List<Node> setupChildren = new ArrayList<>();
+        setupChildren.add(wizardStartNode);
+        setupChildren.add(pairRemoteNode);
+        setupChildren.add(traktNode);
+        setupChildren.add(stremioNode);
+        setupChildren.add(tvRoomNode);
+        setupChildren.add(shSetupNode);
+        setupChildren.add(keysNode);
+        if (s.reelsTabEnabled) {
+            boolean reelsReady = s.reelsConnectedCount > 0;
+            setupChildren.add(actionNode(
+                    "setup_reels_accounts",
+                    "7. Reels TV Accounts & Group Chats (Optional)",
+                    reelsReady
+                            ? ("Connected: " + s.reelsConnectedSummary + " · Rename family members or switch chats")
+                            : "Create a free dedicated TV Instagram/TikTok account, add it to your couple or 3+ family group chat, and sign in once",
+                    reelsReady ? s.reelsConnectedSummary : "Set Up",
+                    "tiktok",
+                    reelsReady,
+                    reelsReady ? StatusTone.POSITIVE : StatusTone.NONE));
+        }
+        setupChildren.add(finishNode);
+
         return groupNode(
                 "initial_setup",
                 "Initial Setup & Cloud",
@@ -2329,7 +2394,7 @@ public final class SettingsTree {
                 allDone,
                 "Steps show live status · Press OK to configure or change any step",
                 tone,
-                Arrays.asList(wizardStartNode, pairRemoteNode, traktNode, stremioNode, tvRoomNode, shSetupNode, keysNode, finishNode));
+                setupChildren);
     }
 
     private static List<Node> buildSmartHomeKeysChildren(StateSnapshot s) {

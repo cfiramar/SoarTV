@@ -207,6 +207,22 @@ describe('TvRemoteService', () => {
     });
   });
 
+  it('dispatches Reels player, Watch Later, and Done Watching commands via /api/reels', async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: true }),
+    });
+    const service = new TvRemoteService('http://192.168.1.50:8484', mockFetch);
+
+    expect(await service.reelsAction('done_watching')).toBe(true);
+    expect(mockFetch).toHaveBeenCalledWith('http://192.168.1.50:8484/api/reels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'done_watching' }),
+    });
+  });
+
   it('toggles Smart Home devices and adjusts AC temperature via /api/smarthome', async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,

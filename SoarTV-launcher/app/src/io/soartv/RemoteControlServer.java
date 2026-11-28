@@ -588,6 +588,10 @@ public final class RemoteControlServer {
             sendJson(out, "200 OK", GamingZone.toStatusJson(appContext).toString(), corsOrigin);
             return;
         }
+        if ("GET".equals(method) && "/api/reels".equals(path)) {
+            sendJson(out, "200 OK", buildReelsStatusJson().toString(), corsOrigin);
+            return;
+        }
         if (!"POST".equals(method)) {
             sendJson(out, "405 Method Not Allowed", "{\"error\":\"Method not allowed\"}", corsOrigin);
             return;
@@ -737,6 +741,41 @@ public final class RemoteControlServer {
                     }
                 });
                 sendJson(out, "200 OK", "{\"ok\":true}", corsOrigin);
+                break;
+            }
+            case "/api/reels": {
+                TvRemoteBridge.wakeTvFromRemote(appContext, false);
+                final String rAction = req.optString("action", "open_feed").trim().toLowerCase(Locale.ROOT);
+                if ("rename_sender".equals(rAction)) {
+                    String src = req.optString("sourceId", "");
+                    String sid = req.optString("senderId", "");
+                    String raw = req.optString("rawUsername", "");
+                    String name = req.optString("displayName", "");
+                    ReelsRepository.get(appContext).saveSenderAlias(src, sid, raw, name);
+                    sendJson(out, "200 OK", buildReelsStatusJson().toString(), corsOrigin);
+                    break;
+                }
+                mainHandler.post(() -> {
+                    try {
+                        if ("open_feed".equals(rAction) || "open_watch_later".equals(rAction)) {
+                            Intent intent = new Intent(appContext, ReelsPlayerActivity.class)
+                                    .putExtra(ReelsPlayerActivity.EXTRA_OPEN_WATCH_LATER, "open_watch_later".equals(rAction))
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                            appContext.startActivity(intent);
+                        } else if ("open_setup".equals(rAction)) {
+                            Intent intent = new Intent(appContext, ReelsConnectActivity.class)
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                            appContext.startActivity(intent);
+                        } else {
+                            Intent bc = new Intent(ReelsPlayerActivity.ACTION_REMOTE_CMD)
+                                    .setPackage(appContext.getPackageName())
+                                    .putExtra(ReelsPlayerActivity.EXTRA_CMD, rAction);
+                            appContext.sendBroadcast(bc);
+                        }
+                    } catch (RuntimeException ignored) {
+                    }
+                });
+                sendJson(out, "200 OK", buildReelsStatusJson().toString(), corsOrigin);
                 break;
             }
             case "/api/smarthome": {
@@ -1026,6 +1065,29 @@ public final class RemoteControlServer {
         TvRemoteBridge.ActiveModal modal = h != null ? h.getActiveModal() : TvRemoteBridge.ActiveModal.INACTIVE;
         RemoteAuthManager.Role callerRole = caller != null ? caller.role : RemoteAuthManager.Role.GUEST;
         out.put("activeModal", (modal != null ? modal : TvRemoteBridge.ActiveModal.INACTIVE).toJsonForRole(callerRole));
+        return out;
+    }
+
+    private JSONObject buildReelsStatusJson() throws JSONException {
+        JSONObject out = new JSONObject();
+        ReelsRepository repo = ReelsRepository.get(appContext);
+        List<String> connected = repo.getConnectedSourceIds();
+        org.json.JSONArray connArr = new org.json.JSONArray();
+        for (String src : connected) connArr.put(src);
+        out.put("ok", true);
+        out.put("connectedSources", connArr);
+        out.put("watchLaterCount", repo.loadWatchLater().size());
+        out.put("cachedUnwatchedCount", repo.loadCachedFeedItems().size());
+        org.json.JSONArray sendersArr = new org.json.JSONArray();
+        for (ReelsModels.SenderAlias s : repo.loadSenderAliases().values()) {
+            JSONObject so = new JSONObject();
+            so.put("sourceId", s.sourceId);
+            so.put("senderId", s.senderId);
+            so.put("rawUsername", s.rawUsername);
+            so.put("displayName", s.effectiveName());
+            sendersArr.put(so);
+        }
+        out.put("senders", sendersArr);
         return out;
     }
 

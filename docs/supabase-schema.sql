@@ -208,14 +208,52 @@ CREATE TABLE IF NOT EXISTS public.media_votes (
 CREATE TABLE IF NOT EXISTS public.shared_reels (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     sender_name text NOT NULL DEFAULT 'Remote',
+    sender_external_id text NOT NULL DEFAULT '',
     recipient_profile_id uuid REFERENCES public.user_profiles(id) ON DELETE SET NULL,
-    url text NOT NULL CHECK (char_length(trim(url)) > 0),
     platform text NOT NULL DEFAULT 'reel',
+    source_thread_id text NOT NULL DEFAULT '',
+    source_message_id text NOT NULL DEFAULT '',
+    item_kind text NOT NULL DEFAULT 'video',
+    url text NOT NULL DEFAULT '',
+    video_url text NOT NULL DEFAULT '',
     title text NOT NULL DEFAULT '',
+    caption text NOT NULL DEFAULT '',
+    message_text text NOT NULL DEFAULT '',
     thumbnail_url text NOT NULL DEFAULT '',
+    is_watched boolean NOT NULL DEFAULT false,
     watched boolean NOT NULL DEFAULT false,
+    watch_later boolean NOT NULL DEFAULT false,
+    watch_later_added_at timestamptz,
+    sent_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT chk_shared_reels_url_nonempty CHECK (
+        char_length(trim(coalesce(url, video_url, ''))) > 0
+        OR (item_kind = 'text' AND char_length(trim(coalesce(message_text, ''))) > 0)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS public.reel_sync_state (
+    source text PRIMARY KEY,
+    thread_id text NOT NULL DEFAULT '',
+    thread_title text NOT NULL DEFAULT '',
+    self_sender_id text NOT NULL DEFAULT '',
+    last_watched_message_id text NOT NULL DEFAULT '',
+    last_watched_sent_at timestamptz,
+    latest_chat_message_id text NOT NULL DEFAULT '',
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.reel_senders (
+    source text NOT NULL,
+    sender_external_id text NOT NULL,
+    raw_username text NOT NULL DEFAULT '',
+    display_name text NOT NULL DEFAULT '',
+    avatar_color integer NOT NULL DEFAULT 0,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (source, sender_external_id)
 );
 
 -- 5. Tier 3 — Per-TV Device Registry & Settings (Permanent TV UUID, Cross-Brand Safe)
@@ -264,12 +302,42 @@ CREATE OR REPLACE TRIGGER trg_shared_reels_updated_at
 CREATE OR REPLACE TRIGGER trg_tv_devices_updated_at
     BEFORE UPDATE ON public.tv_devices FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 
+CREATE OR REPLACE FUNCTION public.sync_shared_reels_columns()
+RETURNS trigger LANGUAGE plpgsql SET search_path = '' AS $$
+BEGIN
+    IF coalesce(NEW.url, '') = '' AND coalesce(NEW.video_url, '') <> '' THEN NEW.url := NEW.video_url;
+    ELSIF coalesce(NEW.video_url, '') = '' AND coalesce(NEW.url, '') <> '' THEN NEW.video_url := NEW.url;
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF NEW.url IS DISTINCT FROM OLD.url THEN NEW.video_url := NEW.url;
+        ELSIF NEW.video_url IS DISTINCT FROM OLD.video_url THEN NEW.url := NEW.video_url; END IF;
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        NEW.watched := coalesce(NEW.watched, false) OR coalesce(NEW.is_watched, false);
+        NEW.is_watched := NEW.watched;
+    ELSE
+        IF NEW.watched IS DISTINCT FROM OLD.watched THEN NEW.is_watched := NEW.watched;
+        ELSIF NEW.is_watched IS DISTINCT FROM OLD.is_watched THEN NEW.watched := NEW.is_watched; END IF;
+    END IF;
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE TRIGGER trg_shared_reels_sync
+    BEFORE INSERT OR UPDATE ON public.shared_reels FOR EACH ROW EXECUTE FUNCTION public.sync_shared_reels_columns();
+CREATE OR REPLACE TRIGGER trg_reel_sync_state_updated_at
+    BEFORE UPDATE ON public.reel_sync_state FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+CREATE OR REPLACE TRIGGER trg_reel_senders_updated_at
+    BEFORE UPDATE ON public.reel_senders FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
 -- 7. Indexes
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_profiles_single_default ON public.user_profiles (is_default) WHERE is_default = true;
 CREATE INDEX IF NOT EXISTS idx_user_profiles_order ON public.user_profiles (is_default DESC, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_watchlist_profile_created ON public.watchlist_items (profile_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_watch_history_profile_watched ON public.watch_history (profile_id, watched_at DESC);
 CREATE INDEX IF NOT EXISTS idx_shared_reels_watched_created ON public.shared_reels (watched, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_shared_reels_watch_later ON public.shared_reels (watch_later, watch_later_added_at ASC) WHERE watch_later = true;
+CREATE INDEX IF NOT EXISTS idx_shared_reels_platform_sent ON public.shared_reels (platform, sent_at ASC);
 CREATE INDEX IF NOT EXISTS idx_shared_reels_recipient ON public.shared_reels (recipient_profile_id);
 CREATE INDEX IF NOT EXISTS idx_tv_devices_active_seen ON public.tv_devices (is_active, last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_gaming_hosts_seen ON public.gaming_hosts (last_seen_at DESC);
@@ -279,14 +347,14 @@ REVOKE TRUNCATE, REFERENCES, TRIGGER ON
     public.household_settings, public.encrypted_vault, public.gaming_hosts,
     public.user_profiles, public.user_profile_settings,
     public.watchlist_items, public.watch_history, public.media_votes,
-    public.shared_reels, public.tv_devices
+    public.shared_reels, public.reel_sync_state, public.reel_senders, public.tv_devices
 FROM anon, authenticated;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON
     public.household_settings, public.encrypted_vault, public.gaming_hosts,
     public.user_profiles, public.user_profile_settings,
     public.watchlist_items, public.watch_history, public.media_votes,
-    public.shared_reels, public.tv_devices
+    public.shared_reels, public.reel_sync_state, public.reel_senders, public.tv_devices
 TO anon, authenticated;
 
 ALTER TABLE public.household_settings ENABLE ROW LEVEL SECURITY;
@@ -298,6 +366,8 @@ ALTER TABLE public.watchlist_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.watch_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.media_votes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.shared_reels ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.reel_sync_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.reel_senders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.tv_devices ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS household_settings_all ON public.household_settings;
@@ -334,6 +404,14 @@ CREATE POLICY household_votes_all ON public.media_votes FOR ALL TO anon, authent
 
 DROP POLICY IF EXISTS household_reels_all ON public.shared_reels;
 CREATE POLICY household_reels_all ON public.shared_reels FOR ALL TO anon, authenticated
+    USING ((SELECT public.is_authorized_soartv_request())) WITH CHECK ((SELECT public.is_authorized_soartv_request()));
+
+DROP POLICY IF EXISTS household_reel_sync_state_all ON public.reel_sync_state;
+CREATE POLICY household_reel_sync_state_all ON public.reel_sync_state FOR ALL TO anon, authenticated
+    USING ((SELECT public.is_authorized_soartv_request())) WITH CHECK ((SELECT public.is_authorized_soartv_request()));
+
+DROP POLICY IF EXISTS household_reel_senders_all ON public.reel_senders;
+CREATE POLICY household_reel_senders_all ON public.reel_senders FOR ALL TO anon, authenticated
     USING ((SELECT public.is_authorized_soartv_request())) WITH CHECK ((SELECT public.is_authorized_soartv_request()));
 
 DROP POLICY IF EXISTS household_tv_devices_all ON public.tv_devices;

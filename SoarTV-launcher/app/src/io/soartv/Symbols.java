@@ -63,6 +63,12 @@ final class Symbols {
             case "metacritic":
             case "search":
             case "tiktok":
+            case "instagram":
+            case "youtube":
+            case "x_social":
+            case "folder":
+            case "bookmark":
+            case "message":
             case "controller":
             case "fan":
             case "ac":
@@ -831,6 +837,71 @@ final class Symbols {
             cv.drawRect(82f, 68f, 92f, 80f, p);
             cv.drawRect(98f, 68f, 108f, 80f, p);
             cv.drawRect(42f, 80f, 52f, 92f, p);
+        } else if ("instagram".equals(name)) {
+            // Instagram camera glyph: rounded square + lens circle + top-right dot
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(13f);
+            p.setStrokeCap(Paint.Cap.ROUND);
+            p.setStrokeJoin(Paint.Join.ROUND);
+            cv.drawRoundRect(new RectF(26f, 26f, 134f, 134f), 30f, 30f, p);
+            cv.drawCircle(80f, 80f, 26f, p);
+            p.setStyle(Paint.Style.FILL);
+            cv.drawCircle(114f, 46f, 8f, p);
+        } else if ("youtube".equals(name)) {
+            // YouTube Shorts / video play pill
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(12f);
+            p.setStrokeJoin(Paint.Join.ROUND);
+            cv.drawRoundRect(new RectF(18f, 36f, 142f, 124f), 26f, 26f, p);
+            p.setStyle(Paint.Style.FILL);
+            Path tri = new Path();
+            tri.moveTo(68f, 58f);
+            tri.lineTo(106f, 80f);
+            tri.lineTo(68f, 102f);
+            tri.close();
+            cv.drawPath(tri, p);
+        } else if ("x_social".equals(name)) {
+            // X social stylized diagonal strokes
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(14f);
+            p.setStrokeCap(Paint.Cap.ROUND);
+            cv.drawLine(34f, 32f, 126f, 128f, p);
+            cv.drawLine(126f, 32f, 34f, 128f, p);
+        } else if ("folder".equals(name)) {
+            // Watch Later folder glyph
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(12f);
+            p.setStrokeCap(Paint.Cap.ROUND);
+            p.setStrokeJoin(Paint.Join.ROUND);
+            Path fld = new Path();
+            fld.moveTo(22f, 44f);
+            fld.lineTo(62f, 44f);
+            fld.lineTo(74f, 58f);
+            fld.lineTo(138f, 58f);
+            fld.lineTo(138f, 126f);
+            fld.lineTo(22f, 126f);
+            fld.close();
+            cv.drawPath(fld, p);
+        } else if ("bookmark".equals(name)) {
+            // Filled Watch Later saved bookmark
+            p.setStyle(Paint.Style.FILL);
+            Path bm = new Path();
+            bm.moveTo(42f, 26f);
+            bm.lineTo(118f, 26f);
+            bm.lineTo(118f, 134f);
+            bm.lineTo(80f, 106f);
+            bm.lineTo(42f, 134f);
+            bm.close();
+            cv.drawPath(bm, p);
+        } else if ("message".equals(name)) {
+            // Chat text bubble glyph
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(12f);
+            p.setStrokeCap(Paint.Cap.ROUND);
+            p.setStrokeJoin(Paint.Join.ROUND);
+            cv.drawRoundRect(new RectF(24f, 30f, 136f, 108f), 22f, 22f, p);
+            cv.drawLine(46f, 108f, 36f, 132f, p);
+            cv.drawLine(36f, 132f, 68f, 108f, p);
         } else if ("gallery_wildlife".equals(name)) {
             // Wildlife Photography: Soaring eagle / bird silhouette with curved wingspan
             p.setStyle(Paint.Style.STROKE);

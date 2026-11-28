@@ -424,7 +424,8 @@ if [ -d tests ] && [ -n "$(find tests -name '*.java' 2>/dev/null)" ]; then
     AdversarialM5CatalogSuite \
     SettingsRedesignTests \
     FeatureTabsTest \
-    CloudSyncV2Tests; do
+    CloudSyncV2Tests \
+    ReelsFeatureTests; do
     if [ -f "tests/${suite}.java" ]; then
       MSYS2_ARG_CONV_EXCL="*" "$JAVA" -cp "out/classes$CPSEP$AJ" "io.soartv.${suite}"
     fi

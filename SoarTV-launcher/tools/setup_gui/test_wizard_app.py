@@ -103,6 +103,20 @@ class SoarTvSetupStudioTests(unittest.TestCase):
         self.assertNotIn("hue_secret_value", p2)
         self.assertNotIn("4K Windows", p2)
         self.assertNotIn("60fps", p2)
+        self.assertNotIn("Reels & TikTok Tab", p2)
+
+        p3 = AgentPromptBuilder.build_prompt(
+            tv_platform="android_tv",
+            tv_ip="192.168.1.42",
+            city="Austin",
+            enable_smarthome=False,
+            smarthome_devices=[],
+            enable_gaming=False,
+            games_dirs="",
+            enable_reels=True,
+        )
+        self.assertIn("Reels & TikTok Tab: ENABLE", p3)
+        self.assertIn("dedicated free TV Instagram/TikTok accounts", p3)
 
     def test_custom_smarthome_brands_mask_secrets_and_preserve_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
